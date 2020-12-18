@@ -99,3 +99,5 @@ if (TARGET PaRSEC::parsec)
   	endif(EIGEN3_FOUND AND TARGET MADworld)
   endif (TRUE)
 endif(TARGET PaRSEC::parsec)
+
+include(Testings.cmake)

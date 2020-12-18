@@ -75,6 +75,27 @@ if (TARGET MADworld)
 endif(TARGET MADworld)
 
 ##########################
+#### Test infrastructure
+##########################
+SET(DART_TESTING_TIMEOUT 120)
+enable_testing()
+
+set(CTEST_SHM_LAUNCHER
+        "" CACHE STRING
+        "A command to run shared memory testings")
+string(REPLACE " " ";" SHM_TEST_CMD_LIST "${CTEST_SHM_LAUNCHER}")
+set(CTEST_MPI_LAUNCHER
+        "${MPIEXEC} ${MPIEXEC_PREFLAGS} ${MPIEXEC_NUMPROC_FLAG}" CACHE STRING
+        "A command to run distributed memory testings")
+if( "${CTEST_MPI_LAUNCHER}" STREQUAL "" )
+  MESSAGE(WARNING "MPI tests will most likely not work: 'CTEST_MPI_LAUNCHER' is not set")
+endif()
+string(REPLACE " " ";" MPI_TEST_CMD_LIST "${CTEST_MPI_LAUNCHER}")
+set(CTEST_GPU_LAUNCHER_OPTIONS
+        "" CACHE STRING
+        "Options to pass to the CTEST_MPI_LAUNCHER to select GPU nodes")
+
+##########################
 #### Components
 ##########################
 add_subdirectory(ttg)

@@ -889,9 +889,9 @@ static void initBlSpHardCoded(const std::function<int(const Key<2> &)> &keymap, 
     a_colidx_to_rowidx[j].emplace_back(i);
     if (keymap(ij) == rank) {
       A_elements.emplace_back(*(ij.begin()), *(ij.begin() + 1), blk_t(btas::Range(128, 256), value));
-      if (buildRefs && rank == 0) {
-        Aref_elements.emplace_back(*(ij.begin()), *(ij.begin() + 1), blk_t(btas::Range(128, 256), value));
-      }
+    }
+    if (buildRefs && rank == 0) {
+      Aref_elements.emplace_back(*(ij.begin()), *(ij.begin() + 1), blk_t(btas::Range(128, 256), value));
     }
   };
 
@@ -918,9 +918,9 @@ static void initBlSpHardCoded(const std::function<int(const Key<2> &)> &keymap, 
     b_colidx_to_rowidx[j].emplace_back(i);
     if (keymap(ij) == rank) {
       B_elements.emplace_back(*(ij.begin()), *(ij.begin() + 1), blk_t(btas::Range(128, 256), value));
-      if (buildRefs && rank == 0) {
-        Bref_elements.emplace_back(*(ij.begin()), *(ij.begin() + 1), blk_t(btas::Range(128, 256), value));
-      }
+    }
+    if (buildRefs && rank == 0) {
+      Bref_elements.emplace_back(*(ij.begin()), *(ij.begin() + 1), blk_t(btas::Range(128, 256), value));
     }
   };
   emplace_B_element({0, 0}, 12.3);
@@ -1537,7 +1537,7 @@ int main(int argc, char **argv) {
     for (int nt = 0; nt < N; nt++) nTiles.emplace_back(1);
     for (int kt = 0; kt < K; kt++) kTiles.emplace_back(1);
 #else  // !defined(BLOCK_SPARSE_GEMM)
-    if (argc >= 2) {
+    if (argc >= 4) {
 #ifndef BSPMM_HAS_LIBINT
       std::string Mstr(getCmdOption(argv, argv + argc, "-M"));
       M = parseOption(Mstr, 1200);
@@ -1572,12 +1572,11 @@ int main(int argc, char **argv) {
       std::cerr << "#Generating matrices with Libint2 on " << xyz_filename << " and " << cores << " cores" << std::endl;
       auto start = std::chrono::high_resolution_clock::now();
       initBlSpLibint2(libint2::Operator::yukawa, libint2::any{op_param}, atoms, basis_name,
-                      tile_perelem_2norm_threshold, bc_keymap, maxTs, cores == -1 ? 1 : cores, A, B,
-                      Aref, Bref, check, mTiles, nTiles,kTiles, a_rowidx_to_colidx,
-                      a_colidx_to_rowidx, b_rowidx_to_colidx, b_colidx_to_rowidx, avg_nb,Adensity,
-                      Bdensity);
+                      tile_perelem_2norm_threshold, bc_keymap, maxTs, cores == -1 ? 1 : cores, A, B, Aref, Bref, check,
+                      mTiles, nTiles, kTiles, a_rowidx_to_colidx, a_colidx_to_rowidx, b_rowidx_to_colidx,
+                      b_colidx_to_rowidx, avg_nb, Adensity, Bdensity);
       auto end = std::chrono::high_resolution_clock::now();
-      auto duration = duration_cast<std::chrono::seconds>(end-start);
+      auto duration = duration_cast<std::chrono::seconds>(end - start);
       std::cerr << "#Generation done (" << duration.count() << "s)" << std::endl;
       tiling_type << xyz_filename << "_" << basis_name << "_" << tile_perelem_2norm_threshold << "_" << op_param;
 #endif
@@ -1647,7 +1646,7 @@ int main(int argc, char **argv) {
         std::cout << "||Cref - C||_2      = " << std::sqrt(norm_2_square) << std::endl;
         std::cout << "||Cref - C||_\\infty = " << norm_inf << std::endl;
         if (norm_inf > 1e-9) {
-          if(Cref.nonZeros() < 100) {
+          if (Cref.nonZeros() < 100) {
             std::cout << "Cref:\n" << Cref << std::endl;
             std::cout << "C:\n" << C << std::endl;
           }

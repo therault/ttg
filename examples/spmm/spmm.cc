@@ -33,6 +33,13 @@
 #include <thread>
 #endif
 
+// TA is only usable if MADNESS backend is used
+#if defined(BSPMM_HAS_TILEDARRAY) && defined(TTG_USE_MADNESS)
+#define BSPMM_BUILD_TA_TEST
+#include <TiledArray/pmap/user_pmap.h>
+#include <tiledarray.h>
+#endif
+
 #include "ttg.h"
 
 using namespace ttg;
@@ -44,7 +51,15 @@ using namespace ttg;
 #include "active-set-strategy.h"
 
 #if defined(BLOCK_SPARSE_GEMM)
-using blk_t = btas::Tensor<double, btas::DEFAULT::range, btas::mohndle<btas::varray<double>, btas::Handle::shared_ptr>>;
+// shallow-copy storage
+using storage_type = btas::mohndle<btas::varray<double>, btas::Handle::shared_ptr>;
+// deep-copy storage
+// using storage_type = btas::varray<double>;
+#ifndef BSPMM_BUILD_TA_TEST  // TA overloads btas's impl of btas::dot with its own, but must use TA::Range
+using blk_t = btas::Tensor<double, btas::DEFAULT::range, storage_type>;
+#else
+using blk_t = btas::Tensor<double, TA::Range, storage_type>;
+#endif
 
 #if defined(TTG_USE_PARSEC)
 namespace ttg {
@@ -126,7 +141,7 @@ namespace btas {
     if (C.empty()) {
       C = btas::Tensor<T_, Range_, Store_>(btas::Range(A.range().extent(0), B.range().extent(1)), 0.0);
     }
-    btas::contract_222(1.0, A, array{1, 2}, B, array{2, 3}, 1.0, C, array{1, 3}, false, false);
+    btas::contract(1.0, A, {1, 2}, B, {2, 3}, 1.0, C, {1, 3});
     return std::move(C);
   }
 }  // namespace btas
@@ -351,7 +366,7 @@ class SpMM {
         , mns_((mt_ + dim_ - 1) / dim_)
         , nns_((nt_ + dim_ - 1) / dim_)
         , kns_((kt_ + dim_ - 1) / dim_) {
-      if (tracing()) display_plan();
+      if (tracing()) display_comm_plan();
     }
 
     long strategy_selector(size_t memory, long forced_split) const {
@@ -583,25 +598,9 @@ class SpMM {
       return std::make_tuple(steps, steps_per_tile_A, steps_per_tile_B, comm_plan_A, comm_plan_B);
     }
 
-    void display_plan() const {
+    void display_comm_plan() const {
       if (!tracing()) return;
       auto rank = ttg_default_execution_context().rank();
-      for (long i = 0; 0 == rank && i < std::get<0>(steps_).size(); i++) {
-        auto step = std::get<0>(steps_)[i];
-        ttg::print("On rank", rank, "step", i, "has", std::get<1>(step), "local GEMMS and", std::get<0>(step).size(),
-                   "GEMMs in total");
-        if (rank == 0 && std::get<0>(step).size() < 30) {
-          std::ostringstream dbg;
-          dbg << "On rank " << rank << ", Step " << i << " is ";
-          for (auto it : std::get<0>(step)) {
-            dbg << "(" << std::get<0>(it) << "," << std::get<1>(it) << "," << std::get<2>(it) << ") ";
-          }
-          ttg::print(dbg.str());
-        } else {
-          ttg::print("On rank", rank,
-                     "full plan is not displayed because it is too large or displayed by another process");
-        }
-      }
 
       const auto &steps_per_tile_A = std::get<1>(steps_);
       const auto &steps_per_tile_B = std::get<2>(steps_);
@@ -726,11 +725,11 @@ class SpMM {
     std::tuple<long, bool> compute_next_k(long i, long j, long k) const {
       const auto &a_k_range = a_rowidx_to_colidx_.at(i);
       auto a_iter_fence = a_k_range.end();
-      auto a_iter = std::find(a_k_range.begin(), a_iter_fence, k);
+      auto a_iter = std::lower_bound(a_k_range.begin(), a_iter_fence, k);
       assert(a_iter != a_iter_fence);
       const auto &b_k_range = b_colidx_to_rowidx_.at(j);
       auto b_iter_fence = b_k_range.end();
-      auto b_iter = std::find(b_k_range.begin(), b_iter_fence, k);
+      auto b_iter = std::lower_bound(b_k_range.begin(), b_iter_fence, k);
       assert(b_iter != b_iter_fence);
       while (a_iter != a_iter_fence && b_iter != b_iter_fence) {
         ++a_iter;
@@ -786,7 +785,7 @@ class SpMM {
       const Blk &value() { return v_; }
     };
 
-    const gemmset_t &local_gemms(long s) const {
+    gemmset_t local_gemms(long s) const {
       gemmset_t local_gemms;
       auto rank = ttg_default_execution_context().rank();
       long mm = s / (kns_ * nns_);
@@ -842,7 +841,7 @@ class SpMM {
         }
       }
       assert(nb == std::get<1>(std::get<0>(steps_)[s]));
-      return std::get<1>(std::get<0>(steps_)[s]);
+      return nb;
     }
 
     /// Accessors to the local broadcast steps
@@ -2087,8 +2086,9 @@ static void initBlSpLibint2(libint2::Operator libint2_op, libint2::any libint2_o
                             const std::vector<libint2::Atom> atoms, const std::string &basis_set_name,
                             double tile_perelem_2norm_threshold, const std::function<int(const Key<2> &)> &keymap,
                             int maxTs, int nthreads, SpMatrix<> &A, SpMatrix<> &B, SpMatrix<> &Aref, SpMatrix<> &Bref,
-                            bool buildRefs, std::vector<long> &mTiles, std::vector<long> &nTiles,
-                            std::vector<long> &kTiles, std::vector<std::vector<long>> &a_rowidx_to_colidx,
+                            bool buildRefs, std::string saveShapeId, std::vector<long> &mTiles,
+                            std::vector<long> &nTiles, std::vector<long> &kTiles,
+                            std::vector<std::vector<long>> &a_rowidx_to_colidx,
                             std::vector<std::vector<long>> &a_colidx_to_rowidx,
                             std::vector<std::vector<long>> &b_rowidx_to_colidx,
                             std::vector<std::vector<long>> &b_colidx_to_rowidx, double &average_tile_volume,
@@ -2123,6 +2123,7 @@ static void initBlSpLibint2(libint2::Operator libint2_op, libint2::any libint2_o
   auto atom2shell = bs.atom2shell(atoms);
   auto shell2bf = bs.shell2bf();
   auto bf2shell = invert(bs.nbf(), shell2bf);
+  std::cout << "basis set size = " << bs.nbf() << std::endl;
 
   // compute basis tilings by chopping into groups of atoms that are small enough
   std::vector<long> bsTiles;
@@ -2154,6 +2155,18 @@ static void initBlSpLibint2(libint2::Operator libint2_op, libint2::any libint2_o
   mTiles = bsTiles;
   nTiles = bsTiles;
   kTiles = bsTiles;
+  std::cout << "{max,avg} tile size = {" << *std::max_element(bsTiles.begin(), bsTiles.end()) << ","
+            << (double)bs.nbf() / mTiles.size() << "}" << std::endl;
+
+  std::ofstream A_shp_os;
+  bool first_tile = true;
+  const auto saveShape = !saveShapeId.empty();
+  if (saveShape) {
+    A_shp_os.open("bspmm.A.id=" + saveShapeId + ".bs=" + basis_set_name + ".T=" + std::to_string(maxTs) +
+                      ".eps=" + std::to_string(tile_perelem_2norm_threshold) + ".nb",
+                  std::ios_base::out | std::ios_base::trunc);
+    A_shp_os << "SparseArray[{" << std::endl;
+  }
 
   // fill the matrix, only insert tiles with norm greater than the threshold
   auto fill_matrix = [&](const auto &tiles) {
@@ -2184,9 +2197,9 @@ static void initBlSpLibint2(libint2::Operator libint2_op, libint2::any libint2_o
       for (auto row_tile_idx = 0; row_tile_idx != tiles.size(); ++row_tile_idx) {
         const auto row_bf_fence = row_bf_offset + tiles[row_tile_idx];
         const auto row_sh_offset = bf2shell.at(row_bf_offset);
-        assert(row_sh_offset != 1);
+        assert(row_sh_offset != -1);
         const auto row_sh_fence = (row_bf_fence != nbf) ? bf2shell.at(row_bf_fence) : nshell;
-        assert(row_sh_fence != 1);
+        assert(row_sh_fence != -1);
 
         long col_bf_offset = 0;
         for (auto col_tile_idx = 0; col_tile_idx != tiles.size(); ++col_tile_idx) {
@@ -2199,9 +2212,9 @@ static void initBlSpLibint2(libint2::Operator libint2_op, libint2::any libint2_o
                                       ((row_tile_idx * ntiles + col_tile_idx) % nthreads == thread_id);
           if (my_tile) {
             const auto col_sh_offset = bf2shell.at(col_bf_offset);
-            assert(col_sh_offset != 1);
+            assert(col_sh_offset != -1);
             const auto col_sh_fence = (col_bf_fence != nbf) ? bf2shell.at(col_bf_fence) : nshell;
-            assert(col_sh_fence != 1);
+            assert(col_sh_fence != -1);
 
             blk_t tile(btas::Range({row_bf_offset, col_bf_offset}, {row_bf_fence, col_bf_fence}), 0.);
 
@@ -2232,6 +2245,11 @@ static void initBlSpLibint2(libint2::Operator libint2_op, libint2::any libint2_o
                 std::scoped_lock<std::mutex> lock(*mtx);
                 if (buildRefs && rank == 0) {
                   ref_elements.emplace_back(row_tile_idx, col_tile_idx, tile);
+                  if (saveShape) {
+                    A_shp_os << (first_tile ? "" : ", ") << "{" << row_tile_idx + 1 << "," << col_tile_idx + 1
+                             << "} -> " << std::fixed << tile_perelem_2norm << std::endl;
+                    first_tile = false;
+                  }
                 }
                 if (really_my_tile) {
                   elements.emplace_back(row_tile_idx, col_tile_idx, tile);
@@ -2250,6 +2268,7 @@ static void initBlSpLibint2(libint2::Operator libint2_op, libint2::any libint2_o
     };
 
     parallel_do(fill_matrix_impl);
+    if (saveShape) A_shp_os << "}]" << std::endl;
 
     long nnz_tiles = elements.size();  // # of nonzero tiles, currently on this rank only
 
@@ -2308,14 +2327,15 @@ static void initBlSpLibint2(libint2::Operator libint2_op, libint2::any libint2_o
 
 #endif  // defined(BLOCK_SPARSE_GEMM)
 
-static void timed_measurement(SpMatrix<> &A, SpMatrix<> &B, const std::function<int(const Key<2> &)> &keymap,
-                              const std::string &tiling_type, double gflops, double avg_nb, double Adensity,
-                              double Bdensity, const std::vector<std::vector<long>> &a_rowidx_to_colidx,
-                              const std::vector<std::vector<long>> &a_colidx_to_rowidx,
-                              const std::vector<std::vector<long>> &b_rowidx_to_colidx,
-                              const std::vector<std::vector<long>> &b_colidx_to_rowidx, std::vector<long> &mTiles,
-                              std::vector<long> &nTiles, std::vector<long> &kTiles, int M, int N, int K, int P, int Q,
-                              size_t memory, const long forced_split, long lookahead, long comm_threshold) {
+static SpMatrix<> timed_measurement(SpMatrix<> &A, SpMatrix<> &B, const std::function<int(const Key<2> &)> &keymap,
+                                    const std::string &tiling_type, double gflops, double avg_nb, double Adensity,
+                                    double Bdensity, const std::vector<std::vector<long>> &a_rowidx_to_colidx,
+                                    const std::vector<std::vector<long>> &a_colidx_to_rowidx,
+                                    const std::vector<std::vector<long>> &b_rowidx_to_colidx,
+                                    const std::vector<std::vector<long>> &b_colidx_to_rowidx, std::vector<long> &mTiles,
+                                    std::vector<long> &nTiles, std::vector<long> &kTiles, int M, int N, int K, int P,
+                                    int Q, size_t memory, const long forced_split, long lookahead,
+                                    long comm_threshold) {
   int MT = (int)A.rows();
   int NT = (int)B.cols();
   int KT = (int)A.cols();
@@ -2369,6 +2389,8 @@ static void timed_measurement(SpMatrix<> &A, SpMatrix<> &B, const std::function<
               << " average_nb_gemm_per_rank_per_phase= " << avg << " stdev_nb_gemm_per_rank_per_phase= " << stdev
               << std::endl;
   }
+
+  return C;
 }
 
 #if !defined(BLOCK_SPARSE_GEMM)
@@ -2537,8 +2559,10 @@ int main(int argc, char **argv) {
     std::vector<std::vector<long>> b_colidx_to_rowidx;
 
     std::string checkStr(getCmdOption(argv, argv + argc, "-x"));
-    int check = parseOption(checkStr, !(argc >= 2));
+    const int check = parseOption(checkStr, !(argc >= 2));
     timing = (check == 0);
+
+    std::string saveShapeId = check ? getCmdOption(argv, argv + argc, "-sv") : "";
 
 #ifndef BLOCK_SPARSE_GEMM
     if (cmdOptionExists(argv, argv + argc, "-mm")) {
@@ -2600,6 +2624,7 @@ int main(int argc, char **argv) {
       if (basis_name.empty()) basis_name = "cc-pvdz";
       std::string op_param_str(getCmdOption(argv, argv + argc, "-p"));
       auto op_param = parseOption(op_param_str, 1.);
+      if (!saveShapeId.empty()) saveShapeId = saveShapeId + ".p=" + std::to_string(op_param);
       std::string maxTsStr(getCmdOption(argv, argv + argc, "-T"));
       int maxTs = parseOption(maxTsStr, 256);
       std::string eps_param_str(getCmdOption(argv, argv + argc, "-e"));
@@ -2608,11 +2633,13 @@ int main(int argc, char **argv) {
       auto start = std::chrono::high_resolution_clock::now();
       initBlSpLibint2(libint2::Operator::yukawa, libint2::any{op_param}, atoms, basis_name,
                       tile_perelem_2norm_threshold, bc_keymap, maxTs, cores == -1 ? 1 : cores, A, B, Aref, Bref, check,
-                      mTiles, nTiles, kTiles, a_rowidx_to_colidx, a_colidx_to_rowidx, b_rowidx_to_colidx,
+                      saveShapeId, mTiles, nTiles, kTiles, a_rowidx_to_colidx, a_colidx_to_rowidx, b_rowidx_to_colidx,
                       b_colidx_to_rowidx, avg_nb, Adensity, Bdensity);
       auto end = std::chrono::high_resolution_clock::now();
-      auto duration = duration_cast<std::chrono::seconds>(end - start);
-      std::cerr << "#Generation done (" << duration.count() << "s)" << std::endl;
+      auto duration = duration_cast<std::chrono::microseconds>(end - start);
+      std::cerr << "#Generation done (" << duration.count() / 1000000. << "s)" << std::endl;
+      std::cerr << "#Adensity " << Adensity << " mt " << mTiles.size() << " nt " << nTiles.size() << " kt "
+                << kTiles.size() << std::endl;
       tiling_type << xyz_filename << "_" << basis_name << "_" << tile_perelem_2norm_threshold << "_" << op_param;
 #endif
       C.resize(A.rows(), B.cols());
@@ -2633,13 +2660,113 @@ int main(int argc, char **argv) {
     int nb_runs = parseOption(nbrunStr, 1);
 
     if (timing) {
+      SpMatrix<> C;  // store the result in case need to use it
+
       // Start up engine
       ttg_execute(ttg_default_execution_context());
       for (int nrun = 0; nrun < nb_runs; nrun++) {
-        timed_measurement(A, B, bc_keymap, tiling_type.str(), gflops, avg_nb, Adensity, Bdensity, a_rowidx_to_colidx,
-                          a_colidx_to_rowidx, b_rowidx_to_colidx, b_colidx_to_rowidx, mTiles, nTiles, kTiles, M, N, K,
-                          P, Q, memory, forced_split, lookahead, comm_threshold);
+        C = timed_measurement(A, B, bc_keymap, tiling_type.str(), gflops, avg_nb, Adensity, Bdensity,
+                              a_rowidx_to_colidx, a_colidx_to_rowidx, b_rowidx_to_colidx, b_colidx_to_rowidx, mTiles,
+                              nTiles, kTiles, M, N, K, P, Q, memory, forced_split, lookahead, comm_threshold);
       }
+
+#ifdef BSPMM_BUILD_TA_TEST
+      {
+        // prelims
+        auto MT = mTiles.size();
+        auto NT = nTiles.size();
+        auto KT = kTiles.size();
+        auto &mad_world = ttg_default_execution_context().impl().impl();
+
+        // make tranges
+        auto make_trange1 = [](const auto &tile_sizes) {
+          std::vector<int64_t> hashes;
+          hashes.reserve(tile_sizes.size() + 1);
+          hashes.push_back(0);
+          for (auto &tile_size : tile_sizes) {
+            hashes.push_back(hashes.back() + tile_size);
+          }
+          return TiledArray::TiledRange1(hashes.begin(), hashes.end());
+        };
+        auto mtr1 = make_trange1(mTiles);
+        auto ntr1 = make_trange1(nTiles);
+        auto ktr1 = make_trange1(kTiles);
+        TA::TiledRange A_trange({mtr1, ktr1});
+        TA::TiledRange B_trange({ktr1, ntr1});
+        TA::TiledRange C_trange({mtr1, ntr1});
+
+        // make shapes
+        auto make_shape = [&mad_world](const SpMatrix<> &mat, const auto &trange) {
+          TA::Tensor<float> norms(TA::Range(mat.rows(), mat.cols()), 0.);
+          for (int k = 0; k < mat.outerSize(); ++k) {
+            for (SpMatrix<>::InnerIterator it(mat, k); it; ++it) {
+              auto r = it.row();  // row index
+              auto c = it.col();  // col index (here it is equal to k)
+              const auto &v = it.value();
+              norms(r, c) = std::sqrt(btas::dot(v, v));
+            }
+          }
+          return TA::SparseShape<float>(mad_world, norms, trange);
+        };
+        auto A_shape = make_shape(A, A_trange);
+        auto B_shape = make_shape(B, B_trange);
+        auto C_shape = make_shape(C, C_trange);
+
+        // make pmaps
+        auto A_pmap = std::make_shared<TA::detail::UserPmap>(mad_world, MT * KT, [&](size_t mk) -> size_t {
+          auto [m, k] = std::div((long)mk, (long)KT);
+          return tile2rank(m, k, P, Q);
+        });
+        auto B_pmap = std::make_shared<TA::detail::UserPmap>(mad_world, KT * NT, [&](size_t kn) -> size_t {
+          auto [k, n] = std::div((long)kn, (long)NT);
+          return tile2rank(k, n, P, Q);
+        });
+        auto C_pmap = std::make_shared<TA::detail::UserPmap>(mad_world, MT * NT, [&](size_t mn) -> size_t {
+          auto [m, n] = std::div((long)mn, (long)NT);
+          return tile2rank(m, n, P, Q);
+        });
+
+        // make distarrays
+        auto make_ta = [&mad_world](const SpMatrix<> &mat, const auto &trange, const auto &shape, const auto &pmap) {
+          TA::TSpArrayD mat_ta(mad_world, trange, shape, pmap);
+          for (int k = 0; k < mat.outerSize(); ++k) {
+            for (SpMatrix<>::InnerIterator it(mat, k); it; ++it) {
+              auto r = it.row();  // row index
+              auto c = it.col();  // col index (here it is equal to k)
+              assert(mat_ta.is_local({r, c}) && !mat_ta.is_zero({r, c}));
+              mat_ta.set({r, c}, TA::Tensor<double>(it.value()));
+            }
+          }
+          return mat_ta;
+        };
+        auto A_ta = make_ta(A, A_trange, A_shape, A_pmap);
+        auto B_ta = make_ta(B, B_trange, B_shape, B_pmap);
+
+        for (int nrun = 0; nrun < nb_runs; nrun++) {
+          auto start = std::chrono::high_resolution_clock::now();
+          TA::TSpArrayD C_ta;
+          C_ta("m,n") = (A_ta("m,k") * B_ta("k,n")).set_shape(C_shape);
+          C_ta.world().gop.fence();
+          auto end = std::chrono::high_resolution_clock::now();
+          auto duration = duration_cast<std::chrono::microseconds>(end - start);
+          std::cout << "Time to compute C=A*B in TiledArray = " << duration.count() / 1000000. << std::endl;
+          auto print = [](const auto &label, const SpMatrix<> &mat) {
+            for (int k = 0; k < mat.outerSize(); ++k) {
+              for (SpMatrix<>::InnerIterator it(mat, k); it; ++it) {
+                auto r = it.row();  // row index
+                auto c = it.col();  // col index (here it is equal to k)
+                std::cout << label << ": {" << r << "," << c << "}: " << it.value() << std::endl;
+              }
+            }
+          };
+          //          print("A", A);
+          //          print("C", C);
+          //          std::cout << "A_ta = " << A_ta << std::endl;
+          //          std::cout << "C_ta = " << C_ta << std::endl;
+        }
+      }
+#endif
+
     } else {
       // flow graph needs to exist on every node
       auto keymap_write = [](const Key<2> &key) { return 0; };

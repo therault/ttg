@@ -296,8 +296,6 @@ class SpMM {
 
   long nbphases() const { return plan_->nb_steps(); }
 
-  std::pair<double, double> gemmsperrankperphase() const { return plan_->gemmsperrankperphase(); }
-
   /// Plan: group all GEMMs in blocks of efficient size
   class Plan {
    public:
@@ -517,12 +515,10 @@ class SpMM {
       b_in_comm_step.resize(P_ * Q_);
       comm_plan_A.resize(P_ * Q_);
       comm_plan_B.resize(P_ * Q_);
+      long step_idx = 0;
       for (long mm = 0; mm < mns; mm++) {
         for (long nn = 0; nn < nns; nn++) {
           for (long kk = 0; kk < kns; kk++) {
-            gemmset_t gemms;
-            gemmset_t local_gemms;
-            long nb_local_gemms = 0;
             for (long m = mm * cube_dim; m < (mm + 1) * cube_dim && m < mt; m++) {
               if (m >= a_rowidx_to_colidx_.size() || a_rowidx_to_colidx_[m].empty()) continue;
               for (long k = kk * cube_dim; k < (kk + 1) * cube_dim && k < kt; k++) {
@@ -536,27 +532,22 @@ class SpMM {
                       b_colidx_to_rowidx_[n].end())
                     continue;
                   auto r = keymap_(Key<2>({m, n}));
-                  if (r == rank) {
-                    local_gemms.insert({m, n, k});
-                    nb_local_gemms++;
-                  }
-                  gemms.insert({m, n, k});
                   auto it = steps_per_tile_A.find(std::make_tuple(r, m, k));
                   if (it == steps_per_tile_A.end()) {
                     std::set<long> f;
-                    f.insert(steps.size());
+                    f.insert(step_idx);
                     steps_per_tile_A.insert({std::make_tuple(r, m, k), f});
                   } else {
-                    it->second.insert(steps.size());
+                    it->second.insert(step_idx);
                   }
 
                   it = steps_per_tile_B.find(std::make_tuple(r, k, n));
                   if (it == steps_per_tile_B.end()) {
                     std::set<long> f;
-                    f.insert(steps.size());
+                    f.insert(step_idx);
                     steps_per_tile_B.insert({std::make_tuple(r, k, n), f});
                   } else {
-                    it->second.insert(steps.size());
+                    it->second.insert(step_idx);
                   }
                   auto a_rank = keymap_(Key<2>{m, k});
                   if (a_sent[a_rank].find({m, k}) == a_sent[a_rank].end()) {
@@ -579,7 +570,7 @@ class SpMM {
                 }
               }
             }
-            steps.emplace_back(std::make_tuple(gemms, nb_local_gemms, local_gemms));
+            step_idx++;
           }
         }
       }
@@ -754,7 +745,7 @@ class SpMM {
     }
 
     long nb_steps() const {
-      assert(mns_ * nns_ * kns_ == std::get<0>(steps_).size());
+      //assert(mns_ * nns_ * kns_ == std::get<0>(steps_).size());
       return mns_ * nns_ * kns_;
     }
 
@@ -764,6 +755,7 @@ class SpMM {
       long r = q * this->p() + p;
 
       long s = (i / dim_) * nns_ * kns_ + (j / dim_) * kns_ + (k / dim_);
+      return std::make_tuple(r, s);
       for (long ss = 0l; ss < std::get<0>(steps_).size(); ss++) {
         const gemmset_t *gs = &std::get<0>(std::get<0>(steps_)[ss]);
         if (gs->find({i, j, k}) != gs->end()) {
@@ -810,8 +802,8 @@ class SpMM {
           }
         }
       }
-      assert(local_gemms == std::get<2>(std::get<0>(steps_)[s]));
-      return std::get<2>(std::get<0>(steps_)[s]);
+      //assert(local_gemms == std::get<2>(std::get<0>(steps_)[s]));
+      return local_gemms;
     }
 
     long nb_local_gemms(long s) const {
@@ -840,7 +832,7 @@ class SpMM {
           }
         }
       }
-      assert(nb == std::get<1>(std::get<0>(steps_)[s]));
+      //assert(nb == std::get<1>(std::get<0>(steps_)[s]));
       return nb;
     }
 
@@ -933,32 +925,6 @@ class SpMM {
 
     long q() const { return Q_; }
 
-    std::pair<double, double> gemmsperrankperphase() const {
-      double mean = 0.0, M2 = 0.0, delta, delta2;
-      long count = 0;
-#if 0
-      for (long phase = 0; phase < nb_steps(); phase++) {
-        const gemmset_t &gemms_in_phase = gemms(phase);
-        for (long rank = 0; rank < p() * q(); rank++) {
-          long nbgemm_in_phase_for_rank = 0;
-          for (auto g : gemms_in_phase) {
-            if (keymap_(Key<2>({std::get<0>(g), std::get<1>(g)})) == rank) nbgemm_in_phase_for_rank++;
-          }
-          double x = (double)nbgemm_in_phase_for_rank;
-          count++;
-          delta = x - mean;
-          mean += delta / count;
-          delta2 = x - mean;
-          M2 += delta * delta2;
-        }
-      }
-#endif
-      if (count > 0) {
-        return std::make_pair(mean, sqrt(M2 / count));
-      } else {
-        return std::make_pair(mean, nan("undefined"));
-      }
-    }
   };
 
   /// Central coordinator: ensures that all progress according to the plan
@@ -2379,14 +2345,10 @@ static SpMatrix<> timed_measurement(SpMatrix<> &A, SpMatrix<> &B, const std::fun
   std::string rt("Unkown???");
 #endif
   if (ttg_default_execution_context().rank() == 0) {
-    double avg, stdev;
-    std::tie(avg, stdev) = a_times_b.gemmsperrankperphase();
-
     std::cout << "TTG-" << rt << " PxQxg=   " << P << " " << Q << " 1 average_NB= " << avg_nb << " M= " << M
               << " N= " << N << " K= " << K << " Tiling= " << tiling_type << " A_density= " << Adensity
               << " B_density= " << Bdensity << " gflops= " << gflops << " seconds= " << tc
               << " gflops/s= " << gflops / tc << " nb_phases= " << a_times_b.nbphases() << " lookahead= " << lookahead
-              << " average_nb_gemm_per_rank_per_phase= " << avg << " stdev_nb_gemm_per_rank_per_phase= " << stdev
               << std::endl;
   }
 

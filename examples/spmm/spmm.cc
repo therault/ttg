@@ -2249,10 +2249,7 @@ static void initBlSpLibint2(libint2::Operator libint2_op, libint2::any libint2_o
     parallel_do(fill_matrix_impl);
     if (saveShape) A_shp_os << "}]" << std::endl;
 
-    long nnz_tiles = elements.size();  // # of nonzero tiles, currently on this rank only
-
-    // allreduce metadata: rowidx_to_colidx, colidx_to_rowidx, total_tile_volume, nnz_tiles
-    ttg_sum(ttg_default_execution_context(), nnz_tiles);
+    // allreduce metadata: rowidx_to_colidx, colidx_to_rowidx, total_tile_volume
     ttg_sum(ttg_default_execution_context(), total_tile_volume);
     auto allreduce_vevveclong = [&](std::vector<std::vector<long>> &vvl) {
       std::vector<std::vector<long>> vvl_result(vvl.size());
@@ -2611,7 +2608,7 @@ int main(int argc, char **argv) {
                       saveShapeId, mTiles, nTiles, kTiles, a_rowidx_to_colidx, a_colidx_to_rowidx, b_rowidx_to_colidx,
                       b_colidx_to_rowidx, avg_nb, Adensity, Bdensity);
       auto end = std::chrono::high_resolution_clock::now();
-      auto duration = duration_cast<std::chrono::microseconds>(end - start);
+      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
       std::cerr << "#Generation done (" << duration.count() / 1000000. << "s)" << std::endl;
       std::cerr << "#Adensity " << Adensity << " mt " << mTiles.size() << " nt " << nTiles.size() << " kt "
                 << kTiles.size() << std::endl;
@@ -2723,7 +2720,7 @@ int main(int argc, char **argv) {
           C_ta("m,n") = (A_ta("m,k") * B_ta("k,n")).set_shape(C_shape);
           C_ta.world().gop.fence();
           auto end = std::chrono::high_resolution_clock::now();
-          auto duration = duration_cast<std::chrono::microseconds>(end - start);
+          auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
           std::cout << "Time to compute C=A*B in TiledArray = " << duration.count() / 1000000. << std::endl;
           auto print = [](const auto &label, const SpMatrix<> &mat) {
             for (int k = 0; k < mat.outerSize(); ++k) {

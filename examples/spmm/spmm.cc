@@ -325,8 +325,8 @@ class SpMM {
       }
     };
 
-    using gemmset_t = std::unordered_set<std::tuple<long, long, long>, long_tuple_hash>;
-    using step_vector_t = std::vector<std::tuple<gemmset_t, long, gemmset_t>>;
+    using step_vector_t =
+        std::vector<long /*This is now empty -- keeping something to preserve code until I get rid of everything */>;
     using step_per_tile_t = std::unordered_map<std::tuple<long, long, long>, std::set<long>, long_tuple_hash>;
     using bcastset_t = std::unordered_set<std::tuple<long, long>, long_pair_hash>;
     using comm_plan_t = std::vector<std::vector<bcastset_t>>;
@@ -739,33 +739,12 @@ class SpMM {
 
       long s = (i / dim_) * nns_ * kns_ + (j / dim_) * kns_ + (k / dim_);
       return std::make_tuple(r, s);
-      for (long ss = 0l; ss < std::get<0>(steps_).size(); ss++) {
-        const gemmset_t *gs = &std::get<0>(std::get<0>(steps_)[ss]);
-        if (gs->find({i, j, k}) != gs->end()) {
-          assert(ss == s);
-          return std::make_tuple(r, s);
-        }
-      }
-      abort();
-      return std::make_tuple(r, -1);
     }
 
-    struct GemmCoordinate {
-      long r_;
-      long c_;
-      const Blk v_;
-
-      long row() { return r_; }
-      long col() { return c_; }
-      const Blk &value() { return v_; }
-    };
-
-    gemmset_t local_gemms(long s) const {
-      auto rank = ttg_default_execution_context().rank();
+    void local_gemms(long s, long rank, const std::function<void(const std::tuple<long, long, long> &)> &f) const {
       long mm = s / (kns_ * nns_);
       long nn = s % (kns_ * nns_) / nns_;
       long kk = s % (kns_ * nns_) % nns_;
-      gemmset_t local_gemms;
       for (long m = mm * dim_; m < (mm + 1) * dim_ && m < mt_; m++) {
         for (long n = nn * dim_; n < (nn + 1) * dim_ && n < nt_; n++) {
           auto r = keymap_(Key<2>({m, n}));
@@ -794,7 +773,7 @@ class SpMM {
             }
             if (a_iter == a_iter_fence) break;
             if (b_iter == b_iter_fence) break;
-            local_gemms.insert({m, n, a_colidx});
+            f(std::make_tuple(m, n, a_colidx));
             ++a_iter;
             if (a_iter == a_iter_fence) break;
             ++b_iter;
@@ -802,51 +781,12 @@ class SpMM {
           }
         }
       }
-      return local_gemms;
     }
 
     long nb_local_gemms(long s) const {
-      auto rank = ttg_default_execution_context().rank();
-      long mm = s / (kns_ * nns_);
-      long nn = s % (kns_ * nns_) / nns_;
-      long kk = s % (kns_ * nns_) % nns_;
       long nb = 0;
-      for (long m = mm * dim_; m < (mm + 1) * dim_ && m < mt_; m++) {
-        for (long n = nn * dim_; n < (nn + 1) * dim_ && n < nt_; n++) {
-          auto r = keymap_(Key<2>({m, n}));
-          if (r != rank) continue;
-          const auto &a_k_range = a_rowidx_to_colidx_.at(m);
-          auto a_iter_fence = std::lower_bound(a_k_range.begin(), a_k_range.end(), (kk + 1) * dim_);
-          auto a_iter = std::lower_bound(a_k_range.begin(), a_iter_fence, kk * dim_);
-          if (a_iter == a_iter_fence) continue;
-          const auto &b_k_range = b_colidx_to_rowidx_.at(n);
-          auto b_iter_fence = std::lower_bound(b_k_range.begin(), b_k_range.end(), (kk + 1) * dim_);
-          auto b_iter = std::lower_bound(b_k_range.begin(), b_iter_fence, kk * dim_);
-          if (b_iter == b_iter_fence) continue;
-          while (true) {
-            auto a_colidx = *a_iter;
-            auto b_rowidx = *b_iter;
-            while (a_colidx != b_rowidx) {
-              if (a_colidx < b_rowidx) {
-                ++a_iter;
-                if (a_iter == a_iter_fence) break;
-                a_colidx = *a_iter;
-              } else {
-                ++b_iter;
-                if (b_iter == b_iter_fence) break;
-                b_rowidx = *b_iter;
-              }
-            }
-            if (a_iter == a_iter_fence) break;
-            if (b_iter == b_iter_fence) break;
-            nb++;
-            ++a_iter;
-            if (a_iter == a_iter_fence) break;
-            ++b_iter;
-            if (b_iter == b_iter_fence) break;
-          }
-        }
-      }
+      auto count = [&nb](const std::tuple<long, long, long> &x) { nb++; };
+      local_gemms(s, ttg_default_execution_context().rank(), count);
       return nb;
     }
 
@@ -930,6 +870,15 @@ class SpMM {
     }
 
     /// Accessors to the communication plan
+    struct GemmCoordinate {
+      long r_;
+      long c_;
+      const Blk v_;
+
+      long row() { return r_; }
+      long col() { return c_; }
+      const Blk &value() { return v_; }
+    };
 
     long nb_comm_steps(long rank, bool is_a) const {
       const std::vector<bcastset_t> *cp;
@@ -1039,24 +988,29 @@ class SpMM {
 
       std::unordered_set<std::tuple<int, int>, tuple_hash> seen_a;
       std::unordered_set<std::tuple<int, int>, tuple_hash> seen_b;
-      for (auto x : plan_->local_gemms(s)) {
+      std::vector<Key<4>> riks_keys;
+      std::vector<Key<4>> rkjs_keys;
+      auto bcast_gemms = [&r, &s, &seen_a, &seen_b, &riks_keys, &rkjs_keys](const std::tuple<long, long, long> &x) {
         long gi, gj, gk;
         std::tie(gi, gj, gk) = x;
         if (seen_a.find(std::make_tuple(gi, gk)) == seen_a.end()) {
           if (tracing())
             ttg::print("On rank", r, "Coordinator(", r, ", ", s, "): Sending control to LBCastA(", r, ",", gi, ",", gk,
                        ",", s, ")");
-          ::send<0>(Key<4>({r, gi, gk, s}), std::get<0>(input), out);
+          riks_keys.emplace_back(Key<4>({r, gi, gk, s}));
           seen_a.insert(std::make_tuple(gi, gk));
         }
         if (seen_b.find(std::make_tuple(gk, gj)) == seen_b.end()) {
           if (tracing())
             ttg::print("On rank", r, "Coordinator(", r, ", ", s, "): Sending control to LBCastB(", r, ",", gk, ",", gj,
                        ",", s, ")");
-          ::send<1>(Key<4>({r, gk, gj, s}), std::get<0>(input), out);
+          rkjs_keys.emplace_back(Key<4>({r, gk, gj, s}));
           seen_b.insert(std::make_tuple(gk, gj));
         }
-      }
+      };
+      plan_->local_gemms(s, ttg_default_execution_context().rank(), bcast_gemms);
+      ::broadcast<0>(riks_keys, std::get<0>(input), out);
+      ::broadcast<1>(rkjs_keys, std::get<0>(input), out);
     }
 
    private:
@@ -1272,15 +1226,16 @@ class SpMM {
       if (tracing()) ttg::print("On rank", rank, "LBcastA(", r, ",", i, ",", k, ",", s, ")");
       // broadcast A[i][k] to all local GEMMs in step s, then pass the data to the next step
       std::vector<Key<3>> ijk_keys;
-      for (const auto &x : plan_->local_gemms(s)) {
+      auto bcast = [&ijk_keys, &i, &k, &rank, &s](const std::tuple<long, long, long> &x) {
         long gi, gj, gk;
         std::tie(gi, gj, gk) = x;
-        if (gi != i || gk != k) continue;
+        if (gi != i || gk != k) return;
         ijk_keys.emplace_back(Key<3>{gi, gj, gk});
         if (tracing())
           ttg::print("On rank", rank, "Giving A[", gi, ",", gk, "]", "to GEMM(", gi, ",", gj, ",", gk, ") during step",
                      s);
-      }
+      };
+      plan_->local_gemms(s, ttg_default_execution_context().rank(), bcast);
       ::broadcast<0>(ijk_keys, baseT::template get<0>(a_riks), out);
       auto ns = plan_->next_step_A(r, i, k, s);
       if (ns > -1) {
@@ -1401,15 +1356,16 @@ class SpMM {
       if (tracing()) ttg::print("On rank", r, "LBcastB(", r, ",", k, ",", j, ",", s, ")");
       // broadcast B[k][j] to all local GEMMs in step s, then pass the data to the next step
       std::vector<Key<3>> ijk_keys;
-      for (const auto &x : plan_->local_gemms(s)) {
+      auto bcast = [&ijk_keys, &j, &k, &rank, &s](const std::tuple<long, long, long> &x) {
         long gi, gj, gk;
         std::tie(gi, gj, gk) = x;
-        if (gj != j || gk != k) continue;
+        if (gj != j || gk != k) return;
         ijk_keys.emplace_back(Key<3>{gi, gj, gk});
         if (tracing())
           ttg::print("On rank", rank, "Giving B[", gk, ",", gj, "]", "to GEMM(", gi, ",", gj, ",", gk, ") during step",
                      s);
-      }
+      };
+      plan_->local_gemms(s, ttg_default_execution_context().rank(), bcast);
       ::broadcast<0>(ijk_keys, baseT::template get<0>(b_rkjs), out);
       auto ns = plan_->next_step_B(r, k, j, s);
       if (ns > -1) {

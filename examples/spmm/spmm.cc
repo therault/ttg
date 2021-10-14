@@ -35,9 +35,9 @@
 
 // TA is only usable if MADNESS backend is used
 #if defined(BSPMM_HAS_TILEDARRAY) && defined(TTG_USE_MADNESS)
-# define BSPMM_BUILD_TA_TEST
-# include <tiledarray.h>
-# include <TiledArray/pmap/user_pmap.h>
+#define BSPMM_BUILD_TA_TEST
+#include <TiledArray/pmap/user_pmap.h>
+#include <tiledarray.h>
 #endif
 
 #include "ttg.h"
@@ -54,12 +54,12 @@ using namespace ttg;
 // shallow-copy storage
 using storage_type = btas::mohndle<btas::varray<double>, btas::Handle::shared_ptr>;
 // deep-copy storage
-//using storage_type = btas::varray<double>;
-# ifndef BSPMM_BUILD_TA_TEST  // TA overloads btas's impl of btas::dot with its own, but must use TA::Range
+// using storage_type = btas::varray<double>;
+#ifndef BSPMM_BUILD_TA_TEST  // TA overloads btas's impl of btas::dot with its own, but must use TA::Range
 using blk_t = btas::Tensor<double, btas::DEFAULT::range, storage_type>;
-# else
+#else
 using blk_t = btas::Tensor<double, TA::Range, storage_type>;
-# endif
+#endif
 
 #if defined(TTG_USE_PARSEC)
 namespace ttg {
@@ -296,8 +296,6 @@ class SpMM {
 
   long nbphases() const { return plan_->nb_steps(); }
 
-  std::pair<double, double> gemmsperrankperphase() const { return plan_->gemmsperrankperphase(); }
-
   /// Plan: group all GEMMs in blocks of efficient size
   class Plan {
    public:
@@ -321,14 +319,22 @@ class SpMM {
                (static_cast<size_t>(std::get<2>(k)) << 21);
       }
     };
+    struct long_pair_hash : public std::unary_function<std::tuple<long, long>, std::size_t> {
+      std::size_t operator()(const std::tuple<long, long> &k) const {
+        return static_cast<size_t>(std::get<0>(k)) | (static_cast<size_t>(std::get<1>(k)) << 32);
+      }
+    };
 
-    using gemmset_t = std::set<std::tuple<long, long, long>>;
+    using gemmset_t = std::unordered_set<std::tuple<long, long, long>, long_tuple_hash>;
     using step_vector_t = std::vector<std::tuple<gemmset_t, long, gemmset_t>>;
     using step_per_tile_t = std::unordered_map<std::tuple<long, long, long>, std::set<long>, long_tuple_hash>;
-    using bcastset_t = std::set<std::tuple<long, long>>;
+    using bcastset_t = std::unordered_set<std::tuple<long, long>, long_pair_hash>;
     using comm_plan_t = std::vector<std::vector<bcastset_t>>;
     using step_t = std::tuple<step_vector_t, step_per_tile_t, step_per_tile_t, comm_plan_t, comm_plan_t>;
 
+    const long dim_;
+    const long mt_, nt_, kt_;
+    const long mns_, nns_, kns_;
     const step_t steps_;
 
    public:
@@ -349,17 +355,24 @@ class SpMM {
         , P_(P)
         , Q_(Q)
         , lookahead_(lookahead + 1)  // users generally understand that a lookahead of 0 still progresses
-        , steps_(strategy_selector(memory, forced_split))
-        , comm_threshold_(3) {
-      if (tracing()) display_plan();
+        , dim_(strategy_selector(memory, forced_split))
+        , steps_(regular_cube_strategy(dim_))
+        , comm_threshold_(3)
+        , mt_(mTiles_.size())
+        , nt_(nTiles_.size())
+        , kt_(kTiles_.size())
+        , mns_((mt_ + dim_ - 1) / dim_)
+        , nns_((nt_ + dim_ - 1) / dim_)
+        , kns_((kt_ + dim_ - 1) / dim_) {
+      if (tracing()) display_comm_plan();
     }
 
-    step_t strategy_selector(size_t memory, long forced_split) const {
+    long strategy_selector(size_t memory, long forced_split) const {
       if (0 == forced_split) return active_set_strategy(memory);
-      return regular_cube_strategy(forced_split);
+      return forced_split;
     }
 
-    step_t active_set_strategy(size_t memory) const {
+    long active_set_strategy(size_t memory) const {
       ActiveSetStrategy st(a_rowidx_to_colidx_, a_colidx_to_rowidx_, b_rowidx_to_colidx_, b_colidx_to_rowidx_, mTiles_,
                            nTiles_, kTiles_, memory);
 
@@ -466,7 +479,7 @@ class SpMM {
                    (double)excess / (double)(3 * cube_dim * cube_dim));
       }
 
-      return regular_cube_strategy(cube_dim);
+      return cube_dim;
     }
 
     step_t regular_cube_strategy(long cube_dim) const {
@@ -502,12 +515,10 @@ class SpMM {
       b_in_comm_step.resize(P_ * Q_);
       comm_plan_A.resize(P_ * Q_);
       comm_plan_B.resize(P_ * Q_);
+      long step_idx = 0;
       for (long mm = 0; mm < mns; mm++) {
         for (long nn = 0; nn < nns; nn++) {
           for (long kk = 0; kk < kns; kk++) {
-            gemmset_t gemms;
-            gemmset_t local_gemms;
-            long nb_local_gemms = 0;
             for (long m = mm * cube_dim; m < (mm + 1) * cube_dim && m < mt; m++) {
               if (m >= a_rowidx_to_colidx_.size() || a_rowidx_to_colidx_[m].empty()) continue;
               for (long k = kk * cube_dim; k < (kk + 1) * cube_dim && k < kt; k++) {
@@ -521,28 +532,6 @@ class SpMM {
                       b_colidx_to_rowidx_[n].end())
                     continue;
                   auto r = keymap_(Key<2>({m, n}));
-                  if (r == rank) {
-                    local_gemms.insert({m, n, k});
-                    nb_local_gemms++;
-                  }
-                  gemms.insert({m, n, k});
-                  auto it = steps_per_tile_A.find(std::make_tuple(r, m, k));
-                  if (it == steps_per_tile_A.end()) {
-                    std::set<long> f;
-                    f.insert(steps.size());
-                    steps_per_tile_A.insert({std::make_tuple(r, m, k), f});
-                  } else {
-                    it->second.insert(steps.size());
-                  }
-
-                  it = steps_per_tile_B.find(std::make_tuple(r, k, n));
-                  if (it == steps_per_tile_B.end()) {
-                    std::set<long> f;
-                    f.insert(steps.size());
-                    steps_per_tile_B.insert({std::make_tuple(r, k, n), f});
-                  } else {
-                    it->second.insert(steps.size());
-                  }
                   auto a_rank = keymap_(Key<2>{m, k});
                   if (a_sent[a_rank].find({m, k}) == a_sent[a_rank].end()) {
                     a_sent[a_rank].insert({m, k});
@@ -564,7 +553,7 @@ class SpMM {
                 }
               }
             }
-            steps.emplace_back(std::make_tuple(gemms, nb_local_gemms, local_gemms));
+            step_idx++;
           }
         }
       }
@@ -583,25 +572,9 @@ class SpMM {
       return std::make_tuple(steps, steps_per_tile_A, steps_per_tile_B, comm_plan_A, comm_plan_B);
     }
 
-    void display_plan() const {
+    void display_comm_plan() const {
       if (!tracing()) return;
       auto rank = ttg_default_execution_context().rank();
-      for (long i = 0; 0 == rank && i < std::get<0>(steps_).size(); i++) {
-        auto step = std::get<0>(steps_)[i];
-        ttg::print("On rank", rank, "step", i, "has", std::get<1>(step), "local GEMMS and", std::get<0>(step).size(),
-                   "GEMMs in total");
-        if (rank == 0 && std::get<0>(step).size() < 30) {
-          std::ostringstream dbg;
-          dbg << "On rank " << rank << ", Step " << i << " is ";
-          for (auto it : std::get<0>(step)) {
-            dbg << "(" << std::get<0>(it) << "," << std::get<1>(it) << "," << std::get<2>(it) << ") ";
-          }
-          ttg::print(dbg.str());
-        } else {
-          ttg::print("On rank", rank,
-                     "full plan is not displayed because it is too large or displayed by another process");
-        }
-      }
 
       const auto &steps_per_tile_A = std::get<1>(steps_);
       const auto &steps_per_tile_B = std::get<2>(steps_);
@@ -754,15 +727,22 @@ class SpMM {
       abort();  // unreachable
     }
 
-    long nb_steps() const { return std::get<0>(steps_).size(); }
+    long nb_steps() const {
+      //assert(mns_ * nns_ * kns_ == std::get<0>(steps_).size());
+      return mns_ * nns_ * kns_;
+    }
 
     std::tuple<long, long> gemm_coordinates(long i, long j, long k) const {
       long p = i % this->p();
       long q = j % this->q();
       long r = q * this->p() + p;
-      for (long s = 0l; s < std::get<0>(steps_).size(); s++) {
-        const gemmset_t *gs = &std::get<0>(std::get<0>(steps_)[s]);
+
+      long s = (i / dim_) * nns_ * kns_ + (j / dim_) * kns_ + (k / dim_);
+      return std::make_tuple(r, s);
+      for (long ss = 0l; ss < std::get<0>(steps_).size(); ss++) {
+        const gemmset_t *gs = &std::get<0>(std::get<0>(steps_)[ss]);
         if (gs->find({i, j, k}) != gs->end()) {
+          assert(ss == s);
           return std::make_tuple(r, s);
         }
       }
@@ -780,39 +760,143 @@ class SpMM {
       const Blk &value() { return v_; }
     };
 
-    const gemmset_t &gemms(long s) const { return std::get<0>(std::get<0>(steps_)[s]); }
-    const gemmset_t &local_gemms(long s) const { return std::get<2>(std::get<0>(steps_)[s]); }
+    gemmset_t local_gemms(long s) const {
+      gemmset_t local_gemms;
+      auto rank = ttg_default_execution_context().rank();
+      long mm = s / (kns_ * nns_);
+      long nn = s % (kns_ * nns_) / nns_;
+      long kk = s % (kns_ * nns_) % nns_;
+      for (long m = mm * dim_; m < (mm + 1) * dim_ && m < mt_; m++) {
+        if (m >= a_rowidx_to_colidx_.size() || a_rowidx_to_colidx_[m].empty()) continue;
+        for (long k = kk * dim_; k < (kk + 1) * dim_ && k < kt_; k++) {
+          if (k >= b_rowidx_to_colidx_.size() || b_rowidx_to_colidx_[k].empty()) continue;
+          if (std::find(a_rowidx_to_colidx_[m].begin(), a_rowidx_to_colidx_[m].end(), k) ==
+              a_rowidx_to_colidx_[m].end())
+            continue;
+          for (long n = nn * dim_; n < (nn + 1) * dim_ && n < nt_; n++) {
+            if (n >= b_colidx_to_rowidx_.size() || b_colidx_to_rowidx_[n].empty()) continue;
+            if (std::find(b_colidx_to_rowidx_[n].begin(), b_colidx_to_rowidx_[n].end(), k) ==
+                b_colidx_to_rowidx_[n].end())
+              continue;
+            auto r = keymap_(Key<2>({m, n}));
+            if (r == rank) {
+              local_gemms.insert({m, n, k});
+            }
+          }
+        }
+      }
+      //assert(local_gemms == std::get<2>(std::get<0>(steps_)[s]));
+      return local_gemms;
+    }
 
-    long nb_local_gemms(long s) const { return std::get<1>(std::get<0>(steps_)[s]); }
+    long nb_local_gemms(long s) const {
+      long nb = 0;
+      long mm = s / (kns_ * nns_);
+      long nn = s % (kns_ * nns_) / nns_;
+      long kk = s % (kns_ * nns_) % nns_;
+      auto rank = ttg_default_execution_context().rank();
+
+      for (long m = mm * dim_; m < (mm + 1) * dim_ && m < mt_; m++) {
+        if (m >= a_rowidx_to_colidx_.size() || a_rowidx_to_colidx_[m].empty()) continue;
+        for (long k = kk * dim_; k < (kk + 1) * dim_ && k < kt_; k++) {
+          if (k >= b_rowidx_to_colidx_.size() || b_rowidx_to_colidx_[k].empty()) continue;
+          if (std::find(a_rowidx_to_colidx_[m].begin(), a_rowidx_to_colidx_[m].end(), k) ==
+              a_rowidx_to_colidx_[m].end())
+            continue;
+          for (long n = nn * dim_; n < (nn + 1) * dim_ && n < nt_; n++) {
+            if (n >= b_colidx_to_rowidx_.size() || b_colidx_to_rowidx_[n].empty()) continue;
+            if (std::find(b_colidx_to_rowidx_[n].begin(), b_colidx_to_rowidx_[n].end(), k) ==
+                b_colidx_to_rowidx_[n].end())
+              continue;
+            auto r = keymap_(Key<2>({m, n}));
+            if (r == rank) {
+              nb++;
+            }
+          }
+        }
+      }
+      //assert(nb == std::get<1>(std::get<0>(steps_)[s]));
+      return nb;
+    }
 
     /// Accessors to the local broadcast steps
 
     long first_step_A(long r, long i, long k) const {
-      const std::set<long> &sv = std::get<1>(steps_).at(std::make_tuple(r, i, k));
-      return *sv.begin();
+      for(auto j = 0l; j < b_colidx_to_rowidx_.size(); j++) {
+        auto rank = keymap_(Key<2>{i, j});
+        if(rank != r) continue;
+        for(auto kk = 0l; kk < b_colidx_to_rowidx_[j].size(); kk++) {
+          auto b_k = b_colidx_to_rowidx_[j][kk];
+          if(b_k != k) continue;
+          long rank_gemm, step;
+          std::tie(rank_gemm, step) = gemm_coordinates(i, j, k);
+          assert(rank_gemm == r);
+          return step;
+        }
+      }
+      assert(0);
+      return -1;
     }
 
     long first_step_B(long r, long k, long j) const {
-      const std::set<long> &sv = std::get<2>(steps_).at(std::make_tuple(r, k, j));
-      return *sv.begin();
+      for (auto i = 0l; i < a_rowidx_to_colidx_.size(); i++) {
+        auto rank = keymap_(Key<2>{i, j});
+        if (rank != r) continue;
+        for (auto kk = 0l; kk < a_rowidx_to_colidx_[i].size(); kk++) {
+          auto a_k = a_rowidx_to_colidx_[i][kk];
+          if (a_k != k) continue;
+          long rank_gemm, step;
+          std::tie(rank_gemm, step) = gemm_coordinates(i, j, k);
+          assert(rank_gemm == r);
+          return step;
+        }
+      }
+      assert(0);
+      return -1;
     }
 
     long next_step_A(long r, long i, long k, long s) const {
-      const std::set<long> &sv = std::get<1>(steps_).at(std::make_tuple(r, i, k));
-      auto it = sv.find(s);
-      assert(it != sv.end());
-      it++;
-      if (it == sv.end()) return -1;
-      return *it;
+      bool found = false;
+      long step = -1;
+      for(auto j = 0l; j < b_colidx_to_rowidx_.size(); j++) {
+        auto rank = keymap_(Key<2>{i, j});
+        if(rank != r) continue;
+        for(auto kk = 0l; kk < b_colidx_to_rowidx_[j].size(); kk++) {
+          auto b_k = b_colidx_to_rowidx_[j][kk];
+          if(b_k != k) continue;
+          long s2, rank_gemm;
+          std::tie(rank_gemm, s2) = gemm_coordinates(i, j, k);
+          assert(rank_gemm == r);
+          if(found && s != s2) step = s2;
+          if(s == s2) found = true;
+          break;
+        }
+        if(step != -1) break;
+      }
+      return step;
     }
 
     long next_step_B(long r, long k, long j, long s) const {
-      const std::set<long> &sv = std::get<2>(steps_).at(std::make_tuple(r, k, j));
-      auto it = sv.find(s);
-      assert(it != sv.end());
-      it++;
-      if (it == sv.end()) return -1;
-      return *it;
+      bool found = false;
+      long step = -1;
+
+      for (auto i = 0l; i < a_rowidx_to_colidx_.size(); i++) {
+        auto rank = keymap_(Key<2>{i, j});
+        if (rank != r) continue;
+        for (auto kk = 0l; kk < a_rowidx_to_colidx_[i].size(); kk++) {
+          auto a_k = a_rowidx_to_colidx_[i][kk];
+          if (a_k != k) continue;
+          long rank_gemm, s2;
+          std::tie(rank_gemm, s2) = gemm_coordinates(i, j, k);
+          assert(rank_gemm == r);
+          if(found && s != s2) step = s2;
+          if(s == s2) found = true;
+          break;
+        }
+        if(step != -1)
+          break;
+      }
+      return step;
     }
 
     /// Accessors to the communication plan
@@ -874,38 +958,14 @@ class SpMM {
 
     long q() const { return Q_; }
 
-    std::pair<double, double> gemmsperrankperphase() const {
-      double mean = 0.0, M2 = 0.0, delta, delta2;
-      long count = 0;
-      for (long phase = 0; phase < nb_steps(); phase++) {
-        const gemmset_t &gemms_in_phase = gemms(phase);
-        for (long rank = 0; rank < p() * q(); rank++) {
-          long nbgemm_in_phase_for_rank = 0;
-          for (auto g : gemms_in_phase) {
-            if (keymap_(Key<2>({std::get<0>(g), std::get<1>(g)})) == rank) nbgemm_in_phase_for_rank++;
-          }
-          double x = (double)nbgemm_in_phase_for_rank;
-          count++;
-          delta = x - mean;
-          mean += delta / count;
-          delta2 = x - mean;
-          M2 += delta * delta2;
-        }
-      }
-      if (count > 0) {
-        return std::make_pair(mean, sqrt(M2 / count));
-      } else {
-        return std::make_pair(mean, nan("undefined"));
-      }
-    }
   };
 
   /// Central coordinator: ensures that all progress according to the plan
   class Coordinator : public Op<Key<2>, std::tuple<Out<Key<4>, Control>, Out<Key<4>, Control>, Out<Key<2>, Control>>,
                                 Coordinator, const Control> {
    public:
-    using baseT =
-        Op<Key<2>, std::tuple<Out<Key<4>, Control>, Out<Key<4>, Control>, Out<Key<2>, Control>>, Coordinator, const Control>;
+    using baseT = Op<Key<2>, std::tuple<Out<Key<4>, Control>, Out<Key<4>, Control>, Out<Key<2>, Control>>, Coordinator,
+                     const Control>;
 
     Coordinator(Edge<Key<2>, Control> progress_ctl, Edge<Key<4>, Control> &a_ctl, Edge<Key<4>, Control> &b_ctl,
                 Edge<Key<2>, Control> &c2c_ctl, std::shared_ptr<const Plan> plan, const Keymap &keymap)
@@ -1183,7 +1243,7 @@ class SpMM {
       if (tracing()) ttg::print("On rank", rank, "LBcastA(", r, ",", i, ",", k, ",", s, ")");
       // broadcast A[i][k] to all local GEMMs in step s, then pass the data to the next step
       std::vector<Key<3>> ijk_keys;
-      for (const auto& x : plan_->local_gemms(s)) {
+      for (const auto &x : plan_->local_gemms(s)) {
         long gi, gj, gk;
         std::tie(gi, gj, gk) = x;
         if (gi != i || gk != k) continue;
@@ -1312,7 +1372,7 @@ class SpMM {
       if (tracing()) ttg::print("On rank", r, "LBcastB(", r, ",", k, ",", j, ",", s, ")");
       // broadcast B[k][j] to all local GEMMs in step s, then pass the data to the next step
       std::vector<Key<3>> ijk_keys;
-      for (const auto& x : plan_->local_gemms(s)) {
+      for (const auto &x : plan_->local_gemms(s)) {
         long gi, gj, gk;
         std::tie(gi, gj, gk) = x;
         if (gj != j || gk != k) continue;
@@ -2025,8 +2085,9 @@ static void initBlSpLibint2(libint2::Operator libint2_op, libint2::any libint2_o
                             const std::vector<libint2::Atom> atoms, const std::string &basis_set_name,
                             double tile_perelem_2norm_threshold, const std::function<int(const Key<2> &)> &keymap,
                             int maxTs, int nthreads, SpMatrix<> &A, SpMatrix<> &B, SpMatrix<> &Aref, SpMatrix<> &Bref,
-                            bool buildRefs, std::string saveShapeId, std::vector<long> &mTiles, std::vector<long> &nTiles,
-                            std::vector<long> &kTiles, std::vector<std::vector<long>> &a_rowidx_to_colidx,
+                            bool buildRefs, std::string saveShapeId, std::vector<long> &mTiles,
+                            std::vector<long> &nTiles, std::vector<long> &kTiles,
+                            std::vector<std::vector<long>> &a_rowidx_to_colidx,
                             std::vector<std::vector<long>> &a_colidx_to_rowidx,
                             std::vector<std::vector<long>> &b_rowidx_to_colidx,
                             std::vector<std::vector<long>> &b_colidx_to_rowidx, double &average_tile_volume,
@@ -2093,14 +2154,16 @@ static void initBlSpLibint2(libint2::Operator libint2_op, libint2::any libint2_o
   mTiles = bsTiles;
   nTiles = bsTiles;
   kTiles = bsTiles;
-  std::cout << "{max,avg} tile size = {" << *std::max_element(bsTiles.begin(), bsTiles.end()) << "," <<(double)bs.nbf()/mTiles.size() << "}" << std::endl;
+  std::cout << "{max,avg} tile size = {" << *std::max_element(bsTiles.begin(), bsTiles.end()) << ","
+            << (double)bs.nbf() / mTiles.size() << "}" << std::endl;
 
   std::ofstream A_shp_os;
   bool first_tile = true;
   const auto saveShape = !saveShapeId.empty();
   if (saveShape) {
-    A_shp_os.open("bspmm.A.id="+saveShapeId+".bs=" + basis_set_name + ".T=" + std::to_string(maxTs) +
-                  ".eps=" + std::to_string(tile_perelem_2norm_threshold) + ".nb", std::ios_base::out | std::ios_base::trunc);
+    A_shp_os.open("bspmm.A.id=" + saveShapeId + ".bs=" + basis_set_name + ".T=" + std::to_string(maxTs) +
+                      ".eps=" + std::to_string(tile_perelem_2norm_threshold) + ".nb",
+                  std::ios_base::out | std::ios_base::trunc);
     A_shp_os << "SparseArray[{" << std::endl;
   }
 
@@ -2183,7 +2246,7 @@ static void initBlSpLibint2(libint2::Operator libint2_op, libint2::any libint2_o
                   ref_elements.emplace_back(row_tile_idx, col_tile_idx, tile);
                   if (saveShape) {
                     A_shp_os << (first_tile ? "" : ", ") << "{" << row_tile_idx + 1 << "," << col_tile_idx + 1
-                              << "} -> " << std::fixed << tile_perelem_2norm << std::endl;
+                             << "} -> " << std::fixed << tile_perelem_2norm << std::endl;
                     first_tile = false;
                   }
                 }
@@ -2204,8 +2267,7 @@ static void initBlSpLibint2(libint2::Operator libint2_op, libint2::any libint2_o
     };
 
     parallel_do(fill_matrix_impl);
-    if (saveShape)
-      A_shp_os << "}]" << std::endl;
+    if (saveShape) A_shp_os << "}]" << std::endl;
 
     long nnz_tiles = elements.size();  // # of nonzero tiles, currently on this rank only
 
@@ -2265,13 +2327,14 @@ static void initBlSpLibint2(libint2::Operator libint2_op, libint2::any libint2_o
 #endif  // defined(BLOCK_SPARSE_GEMM)
 
 static SpMatrix<> timed_measurement(SpMatrix<> &A, SpMatrix<> &B, const std::function<int(const Key<2> &)> &keymap,
-                              const std::string &tiling_type, double gflops, double avg_nb, double Adensity,
-                              double Bdensity, const std::vector<std::vector<long>> &a_rowidx_to_colidx,
-                              const std::vector<std::vector<long>> &a_colidx_to_rowidx,
-                              const std::vector<std::vector<long>> &b_rowidx_to_colidx,
-                              const std::vector<std::vector<long>> &b_colidx_to_rowidx, std::vector<long> &mTiles,
-                              std::vector<long> &nTiles, std::vector<long> &kTiles, int M, int N, int K, int P, int Q,
-                              size_t memory, const long forced_split, long lookahead, long comm_threshold) {
+                                    const std::string &tiling_type, double gflops, double avg_nb, double Adensity,
+                                    double Bdensity, const std::vector<std::vector<long>> &a_rowidx_to_colidx,
+                                    const std::vector<std::vector<long>> &a_colidx_to_rowidx,
+                                    const std::vector<std::vector<long>> &b_rowidx_to_colidx,
+                                    const std::vector<std::vector<long>> &b_colidx_to_rowidx, std::vector<long> &mTiles,
+                                    std::vector<long> &nTiles, std::vector<long> &kTiles, int M, int N, int K, int P,
+                                    int Q, size_t memory, const long forced_split, long lookahead,
+                                    long comm_threshold) {
   int MT = (int)A.rows();
   int NT = (int)B.cols();
   int KT = (int)A.cols();
@@ -2315,14 +2378,10 @@ static SpMatrix<> timed_measurement(SpMatrix<> &A, SpMatrix<> &B, const std::fun
   std::string rt("Unkown???");
 #endif
   if (ttg_default_execution_context().rank() == 0) {
-    double avg, stdev;
-    std::tie(avg, stdev) = a_times_b.gemmsperrankperphase();
-
     std::cout << "TTG-" << rt << " PxQxg=   " << P << " " << Q << " 1 average_NB= " << avg_nb << " M= " << M
               << " N= " << N << " K= " << K << " Tiling= " << tiling_type << " A_density= " << Adensity
               << " B_density= " << Bdensity << " gflops= " << gflops << " seconds= " << tc
               << " gflops/s= " << gflops / tc << " nb_phases= " << a_times_b.nbphases() << " lookahead= " << lookahead
-              << " average_nb_gemm_per_rank_per_phase= " << avg << " stdev_nb_gemm_per_rank_per_phase= " << stdev
               << std::endl;
   }
 
@@ -2568,13 +2627,14 @@ int main(int argc, char **argv) {
       std::cerr << "#Generating matrices with Libint2 on " << xyz_filename << " and " << cores << " cores" << std::endl;
       auto start = std::chrono::high_resolution_clock::now();
       initBlSpLibint2(libint2::Operator::yukawa, libint2::any{op_param}, atoms, basis_name,
-                      tile_perelem_2norm_threshold, bc_keymap, maxTs, cores == -1 ? 1 : cores, A, B,
-                      Aref, Bref, check, saveShapeId, mTiles, nTiles,kTiles, a_rowidx_to_colidx,
-                      a_colidx_to_rowidx, b_rowidx_to_colidx, b_colidx_to_rowidx, avg_nb,Adensity,
-                      Bdensity);
+                      tile_perelem_2norm_threshold, bc_keymap, maxTs, cores == -1 ? 1 : cores, A, B, Aref, Bref, check,
+                      saveShapeId, mTiles, nTiles, kTiles, a_rowidx_to_colidx, a_colidx_to_rowidx, b_rowidx_to_colidx,
+                      b_colidx_to_rowidx, avg_nb, Adensity, Bdensity);
       auto end = std::chrono::high_resolution_clock::now();
-      auto duration = duration_cast<std::chrono::microseconds>(end-start);
-      std::cerr << "#Generation done (" << duration.count()/1000000. << "s)" << std::endl;
+      auto duration = duration_cast<std::chrono::microseconds>(end - start);
+      std::cerr << "#Generation done (" << duration.count() / 1000000. << "s)" << std::endl;
+      std::cerr << "#Adensity " << Adensity << " mt " << mTiles.size() << " nt " << nTiles.size() << " kt "
+                << kTiles.size() << std::endl;
       tiling_type << xyz_filename << "_" << basis_name << "_" << tile_perelem_2norm_threshold << "_" << op_param;
 #endif
       C.resize(A.rows(), B.cols());
@@ -2600,9 +2660,9 @@ int main(int argc, char **argv) {
       // Start up engine
       ttg_execute(ttg_default_execution_context());
       for (int nrun = 0; nrun < nb_runs; nrun++) {
-        C = timed_measurement(A, B, bc_keymap, tiling_type.str(), gflops, avg_nb, Adensity, Bdensity, a_rowidx_to_colidx,
-                          a_colidx_to_rowidx, b_rowidx_to_colidx, b_colidx_to_rowidx, mTiles, nTiles, kTiles, M, N, K,
-                          P, Q, memory, forced_split, lookahead, comm_threshold);
+        C = timed_measurement(A, B, bc_keymap, tiling_type.str(), gflops, avg_nb, Adensity, Bdensity,
+                              a_rowidx_to_colidx, a_colidx_to_rowidx, b_rowidx_to_colidx, b_colidx_to_rowidx, mTiles,
+                              nTiles, kTiles, M, N, K, P, Q, memory, forced_split, lookahead, comm_threshold);
       }
 
 #ifdef BSPMM_BUILD_TA_TEST
@@ -2611,13 +2671,16 @@ int main(int argc, char **argv) {
         auto MT = mTiles.size();
         auto NT = nTiles.size();
         auto KT = kTiles.size();
-        auto& mad_world = ttg_default_execution_context().impl().impl();
+        auto &mad_world = ttg_default_execution_context().impl().impl();
 
         // make tranges
-        auto make_trange1 = [](const auto& tile_sizes) {
-          std::vector<int64_t> hashes; hashes.reserve(tile_sizes.size()+1);
+        auto make_trange1 = [](const auto &tile_sizes) {
+          std::vector<int64_t> hashes;
+          hashes.reserve(tile_sizes.size() + 1);
           hashes.push_back(0);
-          for(auto& tile_size: tile_sizes) { hashes.push_back(hashes.back() + tile_size); }
+          for (auto &tile_size : tile_sizes) {
+            hashes.push_back(hashes.back() + tile_size);
+          }
           return TiledArray::TiledRange1(hashes.begin(), hashes.end());
         };
         auto mtr1 = make_trange1(mTiles);
@@ -2628,13 +2691,13 @@ int main(int argc, char **argv) {
         TA::TiledRange C_trange({mtr1, ntr1});
 
         // make shapes
-        auto make_shape = [&mad_world](const SpMatrix<>& mat, const auto& trange) {
+        auto make_shape = [&mad_world](const SpMatrix<> &mat, const auto &trange) {
           TA::Tensor<float> norms(TA::Range(mat.rows(), mat.cols()), 0.);
-          for (int k=0; k<mat.outerSize(); ++k) {
+          for (int k = 0; k < mat.outerSize(); ++k) {
             for (SpMatrix<>::InnerIterator it(mat, k); it; ++it) {
               auto r = it.row();  // row index
               auto c = it.col();  // col index (here it is equal to k)
-              const auto& v = it.value();
+              const auto &v = it.value();
               norms(r, c) = std::sqrt(btas::dot(v, v));
             }
           }
@@ -2645,14 +2708,23 @@ int main(int argc, char **argv) {
         auto C_shape = make_shape(C, C_trange);
 
         // make pmaps
-        auto A_pmap = std::make_shared<TA::detail::UserPmap>(mad_world, MT*KT, [&](size_t mk) -> size_t { auto [m, k] = std::div((long)mk, (long)KT); return tile2rank(m, k, P, Q); } );
-        auto B_pmap = std::make_shared<TA::detail::UserPmap>(mad_world, KT*NT, [&](size_t kn) -> size_t { auto [k, n] = std::div((long)kn, (long)NT); return tile2rank(k, n, P, Q); } );
-        auto C_pmap = std::make_shared<TA::detail::UserPmap>(mad_world, MT*NT, [&](size_t mn) -> size_t { auto [m, n] = std::div((long)mn, (long)NT); return tile2rank(m, n, P, Q); } );
+        auto A_pmap = std::make_shared<TA::detail::UserPmap>(mad_world, MT * KT, [&](size_t mk) -> size_t {
+          auto [m, k] = std::div((long)mk, (long)KT);
+          return tile2rank(m, k, P, Q);
+        });
+        auto B_pmap = std::make_shared<TA::detail::UserPmap>(mad_world, KT * NT, [&](size_t kn) -> size_t {
+          auto [k, n] = std::div((long)kn, (long)NT);
+          return tile2rank(k, n, P, Q);
+        });
+        auto C_pmap = std::make_shared<TA::detail::UserPmap>(mad_world, MT * NT, [&](size_t mn) -> size_t {
+          auto [m, n] = std::div((long)mn, (long)NT);
+          return tile2rank(m, n, P, Q);
+        });
 
         // make distarrays
-        auto make_ta = [&mad_world](const SpMatrix<>& mat, const auto& trange, const auto& shape, const auto& pmap) {
+        auto make_ta = [&mad_world](const SpMatrix<> &mat, const auto &trange, const auto &shape, const auto &pmap) {
           TA::TSpArrayD mat_ta(mad_world, trange, shape, pmap);
-          for (int k=0; k<mat.outerSize(); ++k) {
+          for (int k = 0; k < mat.outerSize(); ++k) {
             for (SpMatrix<>::InnerIterator it(mat, k); it; ++it) {
               auto r = it.row();  // row index
               auto c = it.col();  // col index (here it is equal to k)
@@ -2671,10 +2743,10 @@ int main(int argc, char **argv) {
           C_ta("m,n") = (A_ta("m,k") * B_ta("k,n")).set_shape(C_shape);
           C_ta.world().gop.fence();
           auto end = std::chrono::high_resolution_clock::now();
-          auto duration = duration_cast<std::chrono::microseconds>(end-start);
-          std::cout << "Time to compute C=A*B in TiledArray = " << duration.count()/1000000. << std::endl;
-          auto print = [](const auto& label, const SpMatrix<>& mat) {
-            for (int k=0; k<mat.outerSize(); ++k) {
+          auto duration = duration_cast<std::chrono::microseconds>(end - start);
+          std::cout << "Time to compute C=A*B in TiledArray = " << duration.count() / 1000000. << std::endl;
+          auto print = [](const auto &label, const SpMatrix<> &mat) {
+            for (int k = 0; k < mat.outerSize(); ++k) {
               for (SpMatrix<>::InnerIterator it(mat, k); it; ++it) {
                 auto r = it.row();  // row index
                 auto c = it.col();  // col index (here it is equal to k)
@@ -2682,10 +2754,10 @@ int main(int argc, char **argv) {
               }
             }
           };
-//          print("A", A);
-//          print("C", C);
-//          std::cout << "A_ta = " << A_ta << std::endl;
-//          std::cout << "C_ta = " << C_ta << std::endl;
+          //          print("A", A);
+          //          print("C", C);
+          //          std::cout << "A_ta = " << A_ta << std::endl;
+          //          std::cout << "C_ta = " << C_ta << std::endl;
         }
       }
 #endif
@@ -2729,7 +2801,7 @@ int main(int argc, char **argv) {
         std::cout << "||Cref - C||_2      = " << std::sqrt(norm_2_square) << std::endl;
         std::cout << "||Cref - C||_\\infty = " << norm_inf << std::endl;
         if (norm_inf > 1e-9) {
-          if(Cref.nonZeros() < 100) {
+          if (Cref.nonZeros() < 100) {
             std::cout << "Cref:\n" << Cref << std::endl;
             std::cout << "C:\n" << C << std::endl;
           }

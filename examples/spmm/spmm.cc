@@ -313,29 +313,20 @@ class SpMM {
     const long comm_threshold_;
 
    private:
-    struct long_tuple_hash : public std::unary_function<std::tuple<long, long, long>, std::size_t> {
-      std::size_t operator()(const std::tuple<long, long, long> &k) const {
-        return static_cast<size_t>(std::get<0>(k)) | (static_cast<size_t>(std::get<1>(k)) << 21) |
-               (static_cast<size_t>(std::get<2>(k)) << 21);
-      }
-    };
     struct long_pair_hash : public std::unary_function<std::tuple<long, long>, std::size_t> {
       std::size_t operator()(const std::tuple<long, long> &k) const {
         return static_cast<size_t>(std::get<0>(k)) | (static_cast<size_t>(std::get<1>(k)) << 32);
       }
     };
 
-    using step_vector_t =
-        std::vector<long /*This is now empty -- keeping something to preserve code until I get rid of everything */>;
-    using step_per_tile_t = std::unordered_map<std::tuple<long, long, long>, std::set<long>, long_tuple_hash>;
     using bcastset_t = std::unordered_set<std::tuple<long, long>, long_pair_hash>;
     using comm_plan_t = std::vector<std::vector<bcastset_t>>;
-    using step_t = std::tuple<step_vector_t, step_per_tile_t, step_per_tile_t, comm_plan_t, comm_plan_t>;
+    using full_comm_plan_t = std::tuple<comm_plan_t, comm_plan_t>;
 
     const long dim_;
     const long mt_, nt_, kt_;
     const long mns_, nns_, kns_;
-    const step_t steps_;
+    const full_comm_plan_t comm_plan_;
 
    public:
     Plan(const std::vector<std::vector<long>> &a_rowidx_to_colidx,
@@ -356,7 +347,7 @@ class SpMM {
         , Q_(Q)
         , lookahead_(lookahead + 1)  // users generally understand that a lookahead of 0 still progresses
         , dim_(strategy_selector(memory, forced_split))
-        , steps_(regular_cube_strategy(dim_))
+        , comm_plan_(regular_cube_strategy(dim_))
         , comm_threshold_(3)
         , mt_(mTiles_.size())
         , nt_(nTiles_.size())
@@ -482,10 +473,7 @@ class SpMM {
       return cube_dim;
     }
 
-    step_t regular_cube_strategy(long cube_dim) const {
-      step_vector_t steps;
-      step_per_tile_t steps_per_tile_A;
-      step_per_tile_t steps_per_tile_B;
+    full_comm_plan_t regular_cube_strategy(long cube_dim) const {
       comm_plan_t comm_plan_A;
       comm_plan_t comm_plan_B;
       auto rank = ttg_default_execution_context().rank();
@@ -516,43 +504,34 @@ class SpMM {
       comm_plan_A.resize(P_ * Q_);
       comm_plan_B.resize(P_ * Q_);
       long step_idx = 0;
+      const auto &keymap = keymap_;
+      const auto &comm_threshold = comm_threshold_;
       for (long mm = 0; mm < mns; mm++) {
         for (long nn = 0; nn < nns; nn++) {
           for (long kk = 0; kk < kns; kk++) {
-            for (long m = mm * cube_dim; m < (mm + 1) * cube_dim && m < mt; m++) {
-              if (m >= a_rowidx_to_colidx_.size() || a_rowidx_to_colidx_[m].empty()) continue;
-              for (long k = kk * cube_dim; k < (kk + 1) * cube_dim && k < kt; k++) {
-                if (k >= b_rowidx_to_colidx_.size() || b_rowidx_to_colidx_[k].empty()) continue;
-                if (std::find(a_rowidx_to_colidx_[m].begin(), a_rowidx_to_colidx_[m].end(), k) ==
-                    a_rowidx_to_colidx_[m].end())
-                  continue;
-                for (long n = nn * cube_dim; n < (nn + 1) * cube_dim && n < nt; n++) {
-                  if (n >= b_colidx_to_rowidx_.size() || b_colidx_to_rowidx_[n].empty()) continue;
-                  if (std::find(b_colidx_to_rowidx_[n].begin(), b_colidx_to_rowidx_[n].end(), k) ==
-                      b_colidx_to_rowidx_[n].end())
-                    continue;
-                  auto r = keymap_(Key<2>({m, n}));
-                  auto a_rank = keymap_(Key<2>{m, k});
-                  if (a_sent[a_rank].find({m, k}) == a_sent[a_rank].end()) {
-                    a_sent[a_rank].insert({m, k});
-                    a_in_comm_step[a_rank].insert(std::make_pair(m, k));
-                    if (a_in_comm_step[a_rank].size() >= comm_threshold_) {
-                      comm_plan_A[a_rank].push_back(a_in_comm_step[a_rank]);
-                      a_in_comm_step[a_rank].clear();
-                    }
-                  }
-                  auto b_rank = keymap_(Key<2>{k, n});
-                  if (b_sent[b_rank].find({k, n}) == b_sent[b_rank].end()) {
-                    b_sent[b_rank].insert({k, n});
-                    b_in_comm_step[b_rank].insert(std::make_pair(k, n));
-                    if (b_in_comm_step[b_rank].size() >= comm_threshold_) {
-                      comm_plan_B[b_rank].push_back(b_in_comm_step[b_rank]);
-                      b_in_comm_step[b_rank].clear();
-                    }
-                  }
-                }
-              }
-            }
+            local_gemms(step_idx, -1,
+                        [&a_sent, &a_in_comm_step, &b_sent, &b_in_comm_step, &keymap, &comm_plan_A, &comm_plan_B,
+                         &comm_threshold](long m, long n, long k) {
+                          auto r = keymap(Key<2>({m, n}));
+                          auto a_rank = keymap(Key<2>{m, k});
+                          if (a_sent[a_rank].find({m, k}) == a_sent[a_rank].end()) {
+                            a_sent[a_rank].insert({m, k});
+                            a_in_comm_step[a_rank].insert(std::make_pair(m, k));
+                            if (a_in_comm_step[a_rank].size() >= comm_threshold) {
+                              comm_plan_A[a_rank].push_back(a_in_comm_step[a_rank]);
+                              a_in_comm_step[a_rank].clear();
+                            }
+                          }
+                          auto b_rank = keymap(Key<2>{k, n});
+                          if (b_sent[b_rank].find({k, n}) == b_sent[b_rank].end()) {
+                            b_sent[b_rank].insert({k, n});
+                            b_in_comm_step[b_rank].insert(std::make_pair(k, n));
+                            if (b_in_comm_step[b_rank].size() >= comm_threshold) {
+                              comm_plan_B[b_rank].push_back(b_in_comm_step[b_rank]);
+                              b_in_comm_step[b_rank].clear();
+                            }
+                          }
+                        });
             step_idx++;
           }
         }
@@ -569,41 +548,15 @@ class SpMM {
           a_in_comm_step[r].clear();
         }
       }
-      return std::make_tuple(steps, steps_per_tile_A, steps_per_tile_B, comm_plan_A, comm_plan_B);
+      return std::make_tuple(comm_plan_A, comm_plan_B);
     }
 
     void display_comm_plan() const {
       if (!tracing()) return;
       auto rank = ttg_default_execution_context().rank();
 
-      const auto &steps_per_tile_A = std::get<1>(steps_);
-      const auto &steps_per_tile_B = std::get<2>(steps_);
-      if (0 == rank && steps_per_tile_A.size() <= 32 && steps_per_tile_B.size() <= 32) {
-        ttg::print("Displaying step list per tile of A on rank", rank);
-        for (auto const &it : steps_per_tile_A) {
-          std::stringstream steplist;
-          for (auto const s : it.second) {
-            steplist << s << ",";
-          }
-          ttg::print("On rank", rank, "rank", std::get<0>(it.first), "runs the following steps for A(",
-                     std::get<1>(it.first), ",", std::get<2>(it.first), "):", steplist.str());
-        }
-        ttg::print("Displaying step list per tile of B on rank", rank);
-        for (auto const &it : steps_per_tile_B) {
-          std::stringstream steplist;
-          for (auto const s : it.second) {
-            steplist << s << ",";
-          }
-          ttg::print("On rank", rank, "rank", std::get<0>(it.first), "runs the following steps for B(",
-                     std::get<1>(it.first), ",", std::get<2>(it.first), "):", steplist.str());
-        }
-      } else {
-        ttg::print("On rank", rank, "steps per tile of A is", steps_per_tile_A.size(), "too big to display");
-        ttg::print("On rank", rank, "steps per tile of B is", steps_per_tile_B.size(), "too big to display");
-      }
-
-      const auto &comm_plan_A = std::get<3>(steps_);
-      const auto &comm_plan_B = std::get<4>(steps_);
+      const auto &comm_plan_A = std::get<0>(comm_plan_);
+      const auto &comm_plan_B = std::get<1>(comm_plan_);
       bool display = (rank == 0);
       for (auto r = 0; display && r < comm_plan_A.size(); r++) {
         if (comm_plan_A[r].size() > 900) {
@@ -741,15 +694,15 @@ class SpMM {
       return std::make_tuple(r, s);
     }
 
-    template<typename TupleFn>
-    void local_gemms(long s, long rank, TupleFn&& f) const {
+    template <typename TupleFn>
+    void local_gemms(long s, long rank, TupleFn &&f) const {
       long mm = s / (kns_ * nns_);
       long nn = s % (kns_ * nns_) / nns_;
       long kk = s % (kns_ * nns_) % nns_;
       for (long m = mm * dim_; m < (mm + 1) * dim_ && m < mt_; m++) {
         for (long n = nn * dim_; n < (nn + 1) * dim_ && n < nt_; n++) {
           auto r = keymap_(Key<2>({m, n}));
-          if (r != rank) continue;
+          if (rank != -1 && r != rank) continue;
           const auto &a_k_range = a_rowidx_to_colidx_.at(m);
           auto a_iter_fence = std::lower_bound(a_k_range.begin(), a_k_range.end(), (kk + 1) * dim_);
           auto a_iter = std::lower_bound(a_k_range.begin(), a_iter_fence, kk * dim_);
@@ -884,9 +837,9 @@ class SpMM {
     long nb_comm_steps(long rank, bool is_a) const {
       const std::vector<bcastset_t> *cp;
       if (is_a) {
-        cp = &std::get<3>(steps_)[rank];
+        cp = &std::get<0>(comm_plan_)[rank];
       } else {
-        cp = &std::get<4>(steps_)[rank];
+        cp = &std::get<1>(comm_plan_)[rank];
       }
       return cp->size();
     }
@@ -896,11 +849,11 @@ class SpMM {
       std::vector<GemmCoordinate> res;
       const bcastset_t *bset;
       if (is_a) {
-        const auto &comm_plan = std::get<3>(steps_)[rank];
+        const auto &comm_plan = std::get<0>(comm_plan_)[rank];
         if (comm_step >= comm_plan.size()) return res;
         bset = &(comm_plan[comm_step]);
       } else {
-        const auto &comm_plan = std::get<4>(steps_)[rank];
+        const auto &comm_plan = std::get<1>(comm_plan_)[rank];
         if (comm_step >= comm_plan.size()) return res;
         bset = &(comm_plan[comm_step]);
       }
@@ -920,9 +873,9 @@ class SpMM {
       const std::vector<bcastset_t> *cp;
       auto r = keymap_(Key<2>({i, j}));
       if (is_a) {
-        cp = &std::get<3>(steps_)[r];
+        cp = &std::get<0>(comm_plan_)[r];
       } else {
-        cp = &std::get<4>(steps_)[r];
+        cp = &std::get<1>(comm_plan_)[r];
       }
       long s;
       for (s = 0; s < cp->size() - 1; s++) {
@@ -2328,8 +2281,12 @@ static SpMatrix<> timed_measurement(SpMatrix<> &A, SpMatrix<> &B, const std::fun
   Write_SpMatrix<> c(C, eC, keymap);
   auto &c_status = c.status();
   assert(!has_value(c_status));
+  auto constr_begin = std::chrono::high_resolution_clock::now();
   SpMM<> a_times_b(ctl, eC, A, B, a_rowidx_to_colidx, a_colidx_to_rowidx, b_rowidx_to_colidx, b_colidx_to_rowidx,
                    mTiles, nTiles, kTiles, keymap, P, Q, memory, forced_split, lookahead, comm_threshold);
+  auto constr_end = std::chrono::high_resolution_clock::now();
+  double constr_duration =
+      std::chrono::duration_cast<std::chrono::microseconds>(constr_end - constr_begin).count() / 1e6;
   TTGUNUSED(a_times_b);
 
   auto connected = make_graph_executable(&control, a_times_b.get_reada(), a_times_b.get_readb());
@@ -2337,16 +2294,12 @@ static SpMatrix<> timed_measurement(SpMatrix<> &A, SpMatrix<> &B, const std::fun
   TTGUNUSED(connected);
 
   MPI_Barrier(MPI_COMM_WORLD);
-  struct timeval start {
-    0
-  }, end{0}, diff{0};
-  gettimeofday(&start, nullptr);
+  auto run_begin = std::chrono::high_resolution_clock::now();
   // ready, go! need only 1 kick, so must be done by 1 thread only
   if (ttg_default_execution_context().rank() == 0) control.start(a_times_b.initbound());
   ttg_fence(ttg_default_execution_context());
-  gettimeofday(&end, nullptr);
-  timersub(&end, &start, &diff);
-  double tc = (double)diff.tv_sec + (double)diff.tv_usec / 1e6;
+  auto run_end = std::chrono::high_resolution_clock::now();
+  double run_duration = std::chrono::duration_cast<std::chrono::microseconds>(run_end - run_begin).count() / 1e6;
 #if defined(TTG_USE_MADNESS)
   std::string rt("MAD");
 #elif defined(TTG_USE_PARSEC)
@@ -2357,9 +2310,10 @@ static SpMatrix<> timed_measurement(SpMatrix<> &A, SpMatrix<> &B, const std::fun
   if (ttg_default_execution_context().rank() == 0) {
     std::cout << "TTG-" << rt << " PxQxg=   " << P << " " << Q << " 1 average_NB= " << avg_nb << " M= " << M
               << " N= " << N << " K= " << K << " Tiling= " << tiling_type << " A_density= " << Adensity
-              << " B_density= " << Bdensity << " gflops= " << gflops << " seconds= " << tc
-              << " gflops/s= " << gflops / tc << " nb_phases= " << a_times_b.nbphases() << " lookahead= " << lookahead
-              << std::endl;
+              << " B_density= " << Bdensity << " gflops= " << gflops << " seconds= " << run_duration
+              << " gflops/s= " << gflops / run_duration << " nb_phases= " << a_times_b.nbphases()
+              << " lookahead= " << lookahead << " construction_duration= " << constr_duration
+              << " gflop/s_with_construction= " << gflops / (constr_duration + run_duration) << std::endl;
   }
 
   return C;

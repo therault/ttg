@@ -532,23 +532,6 @@ class SpMM {
                       b_colidx_to_rowidx_[n].end())
                     continue;
                   auto r = keymap_(Key<2>({m, n}));
-                  auto it = steps_per_tile_A.find(std::make_tuple(r, m, k));
-                  if (it == steps_per_tile_A.end()) {
-                    std::set<long> f;
-                    f.insert(step_idx);
-                    steps_per_tile_A.insert({std::make_tuple(r, m, k), f});
-                  } else {
-                    it->second.insert(step_idx);
-                  }
-
-                  it = steps_per_tile_B.find(std::make_tuple(r, k, n));
-                  if (it == steps_per_tile_B.end()) {
-                    std::set<long> f;
-                    f.insert(step_idx);
-                    steps_per_tile_B.insert({std::make_tuple(r, k, n), f});
-                  } else {
-                    it->second.insert(step_idx);
-                  }
                   auto a_rank = keymap_(Key<2>{m, k});
                   if (a_sent[a_rank].find({m, k}) == a_sent[a_rank].end()) {
                     a_sent[a_rank].insert({m, k});
@@ -839,31 +822,81 @@ class SpMM {
     /// Accessors to the local broadcast steps
 
     long first_step_A(long r, long i, long k) const {
-      const std::set<long> &sv = std::get<1>(steps_).at(std::make_tuple(r, i, k));
-      return *sv.begin();
+      for(auto j = 0l; j < b_colidx_to_rowidx_.size(); j++) {
+        auto rank = keymap_(Key<2>{i, j});
+        if(rank != r) continue;
+        for(auto kk = 0l; kk < b_colidx_to_rowidx_[j].size(); kk++) {
+          auto b_k = b_colidx_to_rowidx_[j][kk];
+          if(b_k != k) continue;
+          long rank_gemm, step;
+          std::tie(rank_gemm, step) = gemm_coordinates(i, j, k);
+          assert(rank_gemm == r);
+          return step;
+        }
+      }
+      assert(0);
+      return -1;
     }
 
     long first_step_B(long r, long k, long j) const {
-      const std::set<long> &sv = std::get<2>(steps_).at(std::make_tuple(r, k, j));
-      return *sv.begin();
+      for (auto i = 0l; i < a_rowidx_to_colidx_.size(); i++) {
+        auto rank = keymap_(Key<2>{i, j});
+        if (rank != r) continue;
+        for (auto kk = 0l; kk < a_rowidx_to_colidx_[i].size(); kk++) {
+          auto a_k = a_rowidx_to_colidx_[i][kk];
+          if (a_k != k) continue;
+          long rank_gemm, step;
+          std::tie(rank_gemm, step) = gemm_coordinates(i, j, k);
+          assert(rank_gemm == r);
+          return step;
+        }
+      }
+      assert(0);
+      return -1;
     }
 
     long next_step_A(long r, long i, long k, long s) const {
-      const std::set<long> &sv = std::get<1>(steps_).at(std::make_tuple(r, i, k));
-      auto it = sv.find(s);
-      assert(it != sv.end());
-      it++;
-      if (it == sv.end()) return -1;
-      return *it;
+      bool found = false;
+      long step = -1;
+      for(auto j = 0l; j < b_colidx_to_rowidx_.size(); j++) {
+        auto rank = keymap_(Key<2>{i, j});
+        if(rank != r) continue;
+        for(auto kk = 0l; kk < b_colidx_to_rowidx_[j].size(); kk++) {
+          auto b_k = b_colidx_to_rowidx_[j][kk];
+          if(b_k != k) continue;
+          long s2, rank_gemm;
+          std::tie(rank_gemm, s2) = gemm_coordinates(i, j, k);
+          assert(rank_gemm == r);
+          if(found && s != s2) step = s2;
+          if(s == s2) found = true;
+          break;
+        }
+        if(step != -1) break;
+      }
+      return step;
     }
 
     long next_step_B(long r, long k, long j, long s) const {
-      const std::set<long> &sv = std::get<2>(steps_).at(std::make_tuple(r, k, j));
-      auto it = sv.find(s);
-      assert(it != sv.end());
-      it++;
-      if (it == sv.end()) return -1;
-      return *it;
+      bool found = false;
+      long step = -1;
+
+      for (auto i = 0l; i < a_rowidx_to_colidx_.size(); i++) {
+        auto rank = keymap_(Key<2>{i, j});
+        if (rank != r) continue;
+        for (auto kk = 0l; kk < a_rowidx_to_colidx_[i].size(); kk++) {
+          auto a_k = a_rowidx_to_colidx_[i][kk];
+          if (a_k != k) continue;
+          long rank_gemm, s2;
+          std::tie(rank_gemm, s2) = gemm_coordinates(i, j, k);
+          assert(rank_gemm == r);
+          if(found && s != s2) step = s2;
+          if(s == s2) found = true;
+          break;
+        }
+        if(step != -1)
+          break;
+      }
+      return step;
     }
 
     /// Accessors to the communication plan

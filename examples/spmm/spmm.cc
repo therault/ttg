@@ -728,7 +728,7 @@ class SpMM {
     }
 
     long nb_steps() const {
-      //assert(mns_ * nns_ * kns_ == std::get<0>(steps_).size());
+      // assert(mns_ * nns_ * kns_ == std::get<0>(steps_).size());
       return mns_ * nns_ * kns_;
     }
 
@@ -761,73 +761,104 @@ class SpMM {
     };
 
     gemmset_t local_gemms(long s) const {
-      gemmset_t local_gemms;
       auto rank = ttg_default_execution_context().rank();
       long mm = s / (kns_ * nns_);
       long nn = s % (kns_ * nns_) / nns_;
       long kk = s % (kns_ * nns_) % nns_;
+      gemmset_t local_gemms;
       for (long m = mm * dim_; m < (mm + 1) * dim_ && m < mt_; m++) {
-        if (m >= a_rowidx_to_colidx_.size() || a_rowidx_to_colidx_[m].empty()) continue;
-        for (long k = kk * dim_; k < (kk + 1) * dim_ && k < kt_; k++) {
-          if (k >= b_rowidx_to_colidx_.size() || b_rowidx_to_colidx_[k].empty()) continue;
-          if (std::find(a_rowidx_to_colidx_[m].begin(), a_rowidx_to_colidx_[m].end(), k) ==
-              a_rowidx_to_colidx_[m].end())
-            continue;
-          for (long n = nn * dim_; n < (nn + 1) * dim_ && n < nt_; n++) {
-            if (n >= b_colidx_to_rowidx_.size() || b_colidx_to_rowidx_[n].empty()) continue;
-            if (std::find(b_colidx_to_rowidx_[n].begin(), b_colidx_to_rowidx_[n].end(), k) ==
-                b_colidx_to_rowidx_[n].end())
-              continue;
-            auto r = keymap_(Key<2>({m, n}));
-            if (r == rank) {
-              local_gemms.insert({m, n, k});
+        for (long n = nn * dim_; n < (nn + 1) * dim_ && n < nt_; n++) {
+          auto r = keymap_(Key<2>({m, n}));
+          if (r != rank) continue;
+          const auto &a_k_range = a_rowidx_to_colidx_.at(m);
+          auto a_iter_fence = std::lower_bound(a_k_range.begin(), a_k_range.end(), (kk + 1) * dim_);
+          auto a_iter = std::lower_bound(a_k_range.begin(), a_iter_fence, kk * dim_);
+          if (a_iter == a_iter_fence) continue;
+          const auto &b_k_range = b_colidx_to_rowidx_.at(n);
+          auto b_iter_fence = std::lower_bound(b_k_range.begin(), b_k_range.end(), (kk + 1) * dim_);
+          auto b_iter = std::lower_bound(b_k_range.begin(), b_iter_fence, kk * dim_);
+          if (b_iter == b_iter_fence) continue;
+          while (true) {
+            auto a_colidx = *a_iter;
+            auto b_rowidx = *b_iter;
+            while (a_colidx != b_rowidx) {
+              if (a_colidx < b_rowidx) {
+                ++a_iter;
+                if (a_iter == a_iter_fence) break;
+                a_colidx = *a_iter;
+              } else {
+                ++b_iter;
+                if (b_iter == b_iter_fence) break;
+                b_rowidx = *b_iter;
+              }
             }
+            if (a_iter == a_iter_fence) break;
+            if (b_iter == b_iter_fence) break;
+            local_gemms.insert({m, n, a_colidx});
+            ++a_iter;
+            if (a_iter == a_iter_fence) break;
+            ++b_iter;
+            if (b_iter == b_iter_fence) break;
           }
         }
       }
-      //assert(local_gemms == std::get<2>(std::get<0>(steps_)[s]));
       return local_gemms;
     }
 
     long nb_local_gemms(long s) const {
-      long nb = 0;
+      auto rank = ttg_default_execution_context().rank();
       long mm = s / (kns_ * nns_);
       long nn = s % (kns_ * nns_) / nns_;
       long kk = s % (kns_ * nns_) % nns_;
-      auto rank = ttg_default_execution_context().rank();
-
+      long nb = 0;
       for (long m = mm * dim_; m < (mm + 1) * dim_ && m < mt_; m++) {
-        if (m >= a_rowidx_to_colidx_.size() || a_rowidx_to_colidx_[m].empty()) continue;
-        for (long k = kk * dim_; k < (kk + 1) * dim_ && k < kt_; k++) {
-          if (k >= b_rowidx_to_colidx_.size() || b_rowidx_to_colidx_[k].empty()) continue;
-          if (std::find(a_rowidx_to_colidx_[m].begin(), a_rowidx_to_colidx_[m].end(), k) ==
-              a_rowidx_to_colidx_[m].end())
-            continue;
-          for (long n = nn * dim_; n < (nn + 1) * dim_ && n < nt_; n++) {
-            if (n >= b_colidx_to_rowidx_.size() || b_colidx_to_rowidx_[n].empty()) continue;
-            if (std::find(b_colidx_to_rowidx_[n].begin(), b_colidx_to_rowidx_[n].end(), k) ==
-                b_colidx_to_rowidx_[n].end())
-              continue;
-            auto r = keymap_(Key<2>({m, n}));
-            if (r == rank) {
-              nb++;
+        for (long n = nn * dim_; n < (nn + 1) * dim_ && n < nt_; n++) {
+          auto r = keymap_(Key<2>({m, n}));
+          if (r != rank) continue;
+          const auto &a_k_range = a_rowidx_to_colidx_.at(m);
+          auto a_iter_fence = std::lower_bound(a_k_range.begin(), a_k_range.end(), (kk + 1) * dim_);
+          auto a_iter = std::lower_bound(a_k_range.begin(), a_iter_fence, kk * dim_);
+          if (a_iter == a_iter_fence) continue;
+          const auto &b_k_range = b_colidx_to_rowidx_.at(n);
+          auto b_iter_fence = std::lower_bound(b_k_range.begin(), b_k_range.end(), (kk + 1) * dim_);
+          auto b_iter = std::lower_bound(b_k_range.begin(), b_iter_fence, kk * dim_);
+          if (b_iter == b_iter_fence) continue;
+          while (true) {
+            auto a_colidx = *a_iter;
+            auto b_rowidx = *b_iter;
+            while (a_colidx != b_rowidx) {
+              if (a_colidx < b_rowidx) {
+                ++a_iter;
+                if (a_iter == a_iter_fence) break;
+                a_colidx = *a_iter;
+              } else {
+                ++b_iter;
+                if (b_iter == b_iter_fence) break;
+                b_rowidx = *b_iter;
+              }
             }
+            if (a_iter == a_iter_fence) break;
+            if (b_iter == b_iter_fence) break;
+            nb++;
+            ++a_iter;
+            if (a_iter == a_iter_fence) break;
+            ++b_iter;
+            if (b_iter == b_iter_fence) break;
           }
         }
       }
-      //assert(nb == std::get<1>(std::get<0>(steps_)[s]));
       return nb;
     }
 
     /// Accessors to the local broadcast steps
 
     long first_step_A(long r, long i, long k) const {
-      for(auto j = 0l; j < b_colidx_to_rowidx_.size(); j++) {
+      for (auto j = 0l; j < b_colidx_to_rowidx_.size(); j++) {
         auto rank = keymap_(Key<2>{i, j});
-        if(rank != r) continue;
-        for(auto kk = 0l; kk < b_colidx_to_rowidx_[j].size(); kk++) {
+        if (rank != r) continue;
+        for (auto kk = 0l; kk < b_colidx_to_rowidx_[j].size(); kk++) {
           auto b_k = b_colidx_to_rowidx_[j][kk];
-          if(b_k != k) continue;
+          if (b_k != k) continue;
           long rank_gemm, step;
           std::tie(rank_gemm, step) = gemm_coordinates(i, j, k);
           assert(rank_gemm == r);
@@ -858,20 +889,20 @@ class SpMM {
     long next_step_A(long r, long i, long k, long s) const {
       bool found = false;
       long step = -1;
-      for(auto j = 0l; j < b_colidx_to_rowidx_.size(); j++) {
+      for (auto j = 0l; j < b_colidx_to_rowidx_.size(); j++) {
         auto rank = keymap_(Key<2>{i, j});
-        if(rank != r) continue;
-        for(auto kk = 0l; kk < b_colidx_to_rowidx_[j].size(); kk++) {
+        if (rank != r) continue;
+        for (auto kk = 0l; kk < b_colidx_to_rowidx_[j].size(); kk++) {
           auto b_k = b_colidx_to_rowidx_[j][kk];
-          if(b_k != k) continue;
+          if (b_k != k) continue;
           long s2, rank_gemm;
           std::tie(rank_gemm, s2) = gemm_coordinates(i, j, k);
           assert(rank_gemm == r);
-          if(found && s != s2) step = s2;
-          if(s == s2) found = true;
+          if (found && s != s2) step = s2;
+          if (s == s2) found = true;
           break;
         }
-        if(step != -1) break;
+        if (step != -1) break;
       }
       return step;
     }
@@ -889,12 +920,11 @@ class SpMM {
           long rank_gemm, s2;
           std::tie(rank_gemm, s2) = gemm_coordinates(i, j, k);
           assert(rank_gemm == r);
-          if(found && s != s2) step = s2;
-          if(s == s2) found = true;
+          if (found && s != s2) step = s2;
+          if (s == s2) found = true;
           break;
         }
-        if(step != -1)
-          break;
+        if (step != -1) break;
       }
       return step;
     }
@@ -957,7 +987,6 @@ class SpMM {
     long p() const { return P_; }
 
     long q() const { return Q_; }
-
   };
 
   /// Central coordinator: ensures that all progress according to the plan

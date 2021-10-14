@@ -741,7 +741,8 @@ class SpMM {
       return std::make_tuple(r, s);
     }
 
-    void local_gemms(long s, long rank, const std::function<void(const std::tuple<long, long, long> &)> &f) const {
+    template<typename TupleFn>
+    void local_gemms(long s, long rank, TupleFn&& f) const {
       long mm = s / (kns_ * nns_);
       long nn = s % (kns_ * nns_) / nns_;
       long kk = s % (kns_ * nns_) % nns_;
@@ -773,7 +774,7 @@ class SpMM {
             }
             if (a_iter == a_iter_fence) break;
             if (b_iter == b_iter_fence) break;
-            f(std::make_tuple(m, n, a_colidx));
+            f(m, n, a_colidx);
             ++a_iter;
             if (a_iter == a_iter_fence) break;
             ++b_iter;
@@ -785,7 +786,7 @@ class SpMM {
 
     long nb_local_gemms(long s) const {
       long nb = 0;
-      auto count = [&nb](const std::tuple<long, long, long> &x) { nb++; };
+      auto count = [&nb](long m, long n, long k) { nb++; };
       local_gemms(s, ttg_default_execution_context().rank(), count);
       return nb;
     }
@@ -990,9 +991,7 @@ class SpMM {
       std::unordered_set<std::tuple<int, int>, tuple_hash> seen_b;
       std::vector<Key<4>> riks_keys;
       std::vector<Key<4>> rkjs_keys;
-      auto bcast_gemms = [&r, &s, &seen_a, &seen_b, &riks_keys, &rkjs_keys](const std::tuple<long, long, long> &x) {
-        long gi, gj, gk;
-        std::tie(gi, gj, gk) = x;
+      auto bcast_gemms = [&r, &s, &seen_a, &seen_b, &riks_keys, &rkjs_keys](long gi, long gj, long gk) {
         if (seen_a.find(std::make_tuple(gi, gk)) == seen_a.end()) {
           if (tracing())
             ttg::print("On rank", r, "Coordinator(", r, ", ", s, "): Sending control to LBCastA(", r, ",", gi, ",", gk,
@@ -1226,9 +1225,7 @@ class SpMM {
       if (tracing()) ttg::print("On rank", rank, "LBcastA(", r, ",", i, ",", k, ",", s, ")");
       // broadcast A[i][k] to all local GEMMs in step s, then pass the data to the next step
       std::vector<Key<3>> ijk_keys;
-      auto bcast = [&ijk_keys, &i, &k, &rank, &s](const std::tuple<long, long, long> &x) {
-        long gi, gj, gk;
-        std::tie(gi, gj, gk) = x;
+      auto bcast = [&ijk_keys, &i, &k, &rank, &s](long gi, long gj, long gk) {
         if (gi != i || gk != k) return;
         ijk_keys.emplace_back(Key<3>{gi, gj, gk});
         if (tracing())
@@ -1356,9 +1353,7 @@ class SpMM {
       if (tracing()) ttg::print("On rank", r, "LBcastB(", r, ",", k, ",", j, ",", s, ")");
       // broadcast B[k][j] to all local GEMMs in step s, then pass the data to the next step
       std::vector<Key<3>> ijk_keys;
-      auto bcast = [&ijk_keys, &j, &k, &rank, &s](const std::tuple<long, long, long> &x) {
-        long gi, gj, gk;
-        std::tie(gi, gj, gk) = x;
+      auto bcast = [&ijk_keys, &j, &k, &rank, &s](long gi, long gj, long gk) {
         if (gj != j || gk != k) return;
         ijk_keys.emplace_back(Key<3>{gi, gj, gk});
         if (tracing())
@@ -2254,10 +2249,7 @@ static void initBlSpLibint2(libint2::Operator libint2_op, libint2::any libint2_o
     parallel_do(fill_matrix_impl);
     if (saveShape) A_shp_os << "}]" << std::endl;
 
-    long nnz_tiles = elements.size();  // # of nonzero tiles, currently on this rank only
-
-    // allreduce metadata: rowidx_to_colidx, colidx_to_rowidx, total_tile_volume, nnz_tiles
-    ttg_sum(ttg_default_execution_context(), nnz_tiles);
+    // allreduce metadata: rowidx_to_colidx, colidx_to_rowidx, total_tile_volume
     ttg_sum(ttg_default_execution_context(), total_tile_volume);
     auto allreduce_vevveclong = [&](std::vector<std::vector<long>> &vvl) {
       std::vector<std::vector<long>> vvl_result(vvl.size());
@@ -2616,7 +2608,7 @@ int main(int argc, char **argv) {
                       saveShapeId, mTiles, nTiles, kTiles, a_rowidx_to_colidx, a_colidx_to_rowidx, b_rowidx_to_colidx,
                       b_colidx_to_rowidx, avg_nb, Adensity, Bdensity);
       auto end = std::chrono::high_resolution_clock::now();
-      auto duration = duration_cast<std::chrono::microseconds>(end - start);
+      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
       std::cerr << "#Generation done (" << duration.count() / 1000000. << "s)" << std::endl;
       std::cerr << "#Adensity " << Adensity << " mt " << mTiles.size() << " nt " << nTiles.size() << " kt "
                 << kTiles.size() << std::endl;
@@ -2728,7 +2720,7 @@ int main(int argc, char **argv) {
           C_ta("m,n") = (A_ta("m,k") * B_ta("k,n")).set_shape(C_shape);
           C_ta.world().gop.fence();
           auto end = std::chrono::high_resolution_clock::now();
-          auto duration = duration_cast<std::chrono::microseconds>(end - start);
+          auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
           std::cout << "Time to compute C=A*B in TiledArray = " << duration.count() / 1000000. << std::endl;
           auto print = [](const auto &label, const SpMatrix<> &mat) {
             for (int k = 0; k < mat.outerSize(); ++k) {

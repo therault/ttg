@@ -20,7 +20,6 @@
 #endif  // defined(BTAS_IS_USABLE)
 #endif  // defined(BLOCK_SPARSE_GEMM)
 
-#include <sys/time.h>
 #include <boost/graph/rmat_graph_generator.hpp>
 #if !defined(BLOCK_SPARSE_GEMM)
 #include <boost/graph/directed_graph.hpp>
@@ -30,7 +29,6 @@
 
 #ifdef BSPMM_HAS_LIBINT
 #include <libint2.hpp>
-#include <thread>
 #endif
 
 // TA is only usable if MADNESS backend is used
@@ -493,6 +491,10 @@ class SpMM {
         ttg::print("On rank ", ttg_default_execution_context().rank(), " Planning with a cube_dim of ", cube_dim,
                    " over a problem of ", mt, "x", nt, "x", kt, " gives a plan of ", mns, "x", nns, "x", kns);
 
+      long nnz_in_AB = 0;
+      for (auto mm = 0l; mm < a_rowidx_to_colidx_.size(); mm++) nnz_in_AB += a_rowidx_to_colidx_[mm].size();
+      for (auto mm = 0l; mm < b_rowidx_to_colidx_.size(); mm++) nnz_in_AB += b_rowidx_to_colidx_[mm].size();
+
       std::vector<bcastset_t> a_sent;
       std::vector<bcastset_t> b_sent;
       std::vector<bcastset_t> a_in_comm_step;
@@ -506,15 +508,17 @@ class SpMM {
       long step_idx = 0;
       const auto &keymap = keymap_;
       const auto &comm_threshold = comm_threshold_;
-      for (long mm = 0; mm < mns; mm++) {
-        for (long nn = 0; nn < nns; nn++) {
-          for (long kk = 0; kk < kns; kk++) {
+      for (long mm = 0; (nnz_in_AB > 0) && (mm < mns); mm++) {
+        for (long nn = 0; (nnz_in_AB > 0) && (nn < nns); nn++) {
+          for (long kk = 0; (nnz_in_AB > 0) && (kk < kns); kk++) {
             local_gemms(step_idx, -1,
                         [&a_sent, &a_in_comm_step, &b_sent, &b_in_comm_step, &keymap, &comm_plan_A, &comm_plan_B,
-                         &comm_threshold](long m, long n, long k) {
+                         &comm_threshold, &nnz_in_AB](long m, long n, long k) {
+                          if (nnz_in_AB == 0) return false;
                           auto r = keymap(Key<2>({m, n}));
                           auto a_rank = keymap(Key<2>{m, k});
                           if (a_sent[a_rank].find({m, k}) == a_sent[a_rank].end()) {
+                            nnz_in_AB--;
                             a_sent[a_rank].insert({m, k});
                             a_in_comm_step[a_rank].insert(std::make_pair(m, k));
                             if (a_in_comm_step[a_rank].size() >= comm_threshold) {
@@ -524,6 +528,7 @@ class SpMM {
                           }
                           auto b_rank = keymap(Key<2>{k, n});
                           if (b_sent[b_rank].find({k, n}) == b_sent[b_rank].end()) {
+                            nnz_in_AB--;
                             b_sent[b_rank].insert({k, n});
                             b_in_comm_step[b_rank].insert(std::make_pair(k, n));
                             if (b_in_comm_step[b_rank].size() >= comm_threshold) {
@@ -531,11 +536,13 @@ class SpMM {
                               b_in_comm_step[b_rank].clear();
                             }
                           }
+                          return nnz_in_AB > 0;
                         });
             step_idx++;
           }
         }
       }
+      assert(0 == nnz_in_AB);
       for (long r = 0; r < b_in_comm_step.size(); r++) {
         if (!b_in_comm_step[r].empty()) {
           comm_plan_B[r].push_back(b_in_comm_step[r]);
@@ -727,7 +734,8 @@ class SpMM {
             }
             if (a_iter == a_iter_fence) break;
             if (b_iter == b_iter_fence) break;
-            f(m, n, a_colidx);
+            auto ret = f(m, n, a_colidx);
+            if (!ret) return;
             ++a_iter;
             if (a_iter == a_iter_fence) break;
             ++b_iter;
@@ -739,7 +747,10 @@ class SpMM {
 
     long nb_local_gemms(long s) const {
       long nb = 0;
-      auto count = [&nb](long m, long n, long k) { nb++; };
+      auto count = [&nb](long m, long n, long k) {
+        nb++;
+        return true;
+      };
       local_gemms(s, ttg_default_execution_context().rank(), count);
       return nb;
     }
@@ -959,6 +970,7 @@ class SpMM {
           rkjs_keys.emplace_back(Key<4>({r, gk, gj, s}));
           seen_b.insert(std::make_tuple(gk, gj));
         }
+        return true;
       };
       plan_->local_gemms(s, ttg_default_execution_context().rank(), bcast_gemms);
       ::broadcast<0>(riks_keys, std::get<0>(input), out);
@@ -1179,11 +1191,12 @@ class SpMM {
       // broadcast A[i][k] to all local GEMMs in step s, then pass the data to the next step
       std::vector<Key<3>> ijk_keys;
       auto bcast = [&ijk_keys, &i, &k, &rank, &s](long gi, long gj, long gk) {
-        if (gi != i || gk != k) return;
+        if (gi != i || gk != k) return true;
         ijk_keys.emplace_back(Key<3>{gi, gj, gk});
         if (tracing())
           ttg::print("On rank", rank, "Giving A[", gi, ",", gk, "]", "to GEMM(", gi, ",", gj, ",", gk, ") during step",
                      s);
+        return true;
       };
       plan_->local_gemms(s, ttg_default_execution_context().rank(), bcast);
       ::broadcast<0>(ijk_keys, baseT::template get<0>(a_riks), out);
@@ -1307,11 +1320,12 @@ class SpMM {
       // broadcast B[k][j] to all local GEMMs in step s, then pass the data to the next step
       std::vector<Key<3>> ijk_keys;
       auto bcast = [&ijk_keys, &j, &k, &rank, &s](long gi, long gj, long gk) {
-        if (gj != j || gk != k) return;
+        if (gj != j || gk != k) return true;
         ijk_keys.emplace_back(Key<3>{gi, gj, gk});
         if (tracing())
           ttg::print("On rank", rank, "Giving B[", gk, ",", gj, "]", "to GEMM(", gi, ",", gj, ",", gk, ") during step",
                      s);
+        return true;
       };
       plan_->local_gemms(s, ttg_default_execution_context().rank(), bcast);
       ::broadcast<0>(ijk_keys, baseT::template get<0>(b_rkjs), out);

@@ -508,36 +508,35 @@ class SpMM {
       long step_idx = 0;
       const auto &keymap = keymap_;
       const auto &comm_threshold = comm_threshold_;
+      auto fn = [&a_sent, &a_in_comm_step, &b_sent, &b_in_comm_step, &keymap, &comm_plan_A, &comm_plan_B,
+                  &comm_threshold, &nnz_in_AB](long m, long n, long k) {
+                  if (nnz_in_AB == 0) return false;
+                  auto a_rank = keymap(Key<2>{m, k});
+                  if (a_sent[a_rank].find({m, k}) == a_sent[a_rank].end()) {
+                    nnz_in_AB--;
+                    a_sent[a_rank].insert({m, k});
+                    a_in_comm_step[a_rank].insert(std::make_pair(m, k));
+                    if (a_in_comm_step[a_rank].size() >= comm_threshold) {
+                      comm_plan_A[a_rank].emplace_back(std::move(a_in_comm_step[a_rank]));
+                      a_in_comm_step[a_rank].clear();
+                    }
+                  }
+                  auto b_rank = keymap(Key<2>{k, n});
+                  if (b_sent[b_rank].find({k, n}) == b_sent[b_rank].end()) {
+                    nnz_in_AB--;
+                    b_sent[b_rank].insert({k, n});
+                    b_in_comm_step[b_rank].insert(std::make_pair(k, n));
+                    if (b_in_comm_step[b_rank].size() >= comm_threshold) {
+                      comm_plan_B[b_rank].emplace_back(std::move(b_in_comm_step[b_rank]));
+                      b_in_comm_step[b_rank].clear();
+                    }
+                  }
+                  return nnz_in_AB > 0;
+                };
       for (long mm = 0; (nnz_in_AB > 0) && (mm < mns); mm++) {
         for (long nn = 0; (nnz_in_AB > 0) && (nn < nns); nn++) {
           for (long kk = 0; (nnz_in_AB > 0) && (kk < kns); kk++) {
-            local_gemms(step_idx, -1,
-                        [&a_sent, &a_in_comm_step, &b_sent, &b_in_comm_step, &keymap, &comm_plan_A, &comm_plan_B,
-                         &comm_threshold, &nnz_in_AB](long m, long n, long k) {
-                          if (nnz_in_AB == 0) return false;
-                          auto r = keymap(Key<2>({m, n}));
-                          auto a_rank = keymap(Key<2>{m, k});
-                          if (a_sent[a_rank].find({m, k}) == a_sent[a_rank].end()) {
-                            nnz_in_AB--;
-                            a_sent[a_rank].insert({m, k});
-                            a_in_comm_step[a_rank].insert(std::make_pair(m, k));
-                            if (a_in_comm_step[a_rank].size() >= comm_threshold) {
-                              comm_plan_A[a_rank].push_back(a_in_comm_step[a_rank]);
-                              a_in_comm_step[a_rank].clear();
-                            }
-                          }
-                          auto b_rank = keymap(Key<2>{k, n});
-                          if (b_sent[b_rank].find({k, n}) == b_sent[b_rank].end()) {
-                            nnz_in_AB--;
-                            b_sent[b_rank].insert({k, n});
-                            b_in_comm_step[b_rank].insert(std::make_pair(k, n));
-                            if (b_in_comm_step[b_rank].size() >= comm_threshold) {
-                              comm_plan_B[b_rank].push_back(b_in_comm_step[b_rank]);
-                              b_in_comm_step[b_rank].clear();
-                            }
-                          }
-                          return nnz_in_AB > 0;
-                        });
+            local_gemms(step_idx, -1, fn);
             step_idx++;
           }
         }

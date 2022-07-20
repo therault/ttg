@@ -60,7 +60,7 @@
 #include <parsec/scheduling.h>
 #if defined(PARSEC_PROF_TRACE)
 #include <parsec/profiling.h>
-#define PARSEC_TTG_PROFILE_BACKEND 1
+#undef PARSEC_TTG_PROFILE_BACKEND 1
 #if defined(PARSEC_PROF_GRAPHER)
 #include <parsec/parsec_prof_grapher.h>
 #endif
@@ -70,6 +70,11 @@
 
 #include "ttg/parsec/ttg_data_copy.h"
 
+#undef TTG_PARSEC_DEBUG_TRACK_DATA_COPIES
+
+#if defined(TTG_PARSEC_DEBUG_TRACK_DATA_COPIES)
+#include <unordered_set>
+#endif
 
 /* Whether to defer a potential writer if there are readers.
  * This may avoid extra copies in exchange for concurrency.
@@ -161,6 +166,7 @@ namespace ttg_parsec {
 #if defined(PARSEC_PROF_TRACE) && defined(PARSEC_TTG_PROFILE_BACKEND)
     int parsec_ttg_profile_backend_set_arg_start, parsec_ttg_profile_backend_set_arg_end;
     int parsec_ttg_profile_backend_bcast_arg_start, parsec_ttg_profile_backend_bcast_arg_end;
+    int parsec_ttg_profile_backend_allocate_datacopy, parsec_ttg_profile_backend_free_datacopy;
 #endif
 
     static constexpr const int PARSEC_TTG_MAX_AM_SIZE = 1024 * 1024;
@@ -185,6 +191,10 @@ namespace ttg_parsec {
         parsec_profiling_add_dictionary_keyword("PARSEC_TTG_BCAST_ARG_IMPL", "fill:000000", 0, NULL,
                                                 (int*)&parsec_ttg_profile_backend_bcast_arg_start,
                                                 (int*)&parsec_ttg_profile_backend_bcast_arg_end);
+        parsec_profiling_add_dictionary_keyword("PARSEC_TTG_DATACOPY", "fill:000000", 
+                                                sizeof(size_t), "size{int64_t}",
+                                                (int*)&parsec_ttg_profile_backend_allocate_datacopy,
+                                                (int*)&parsec_ttg_profile_backend_free_datacopy);
 #endif
       }
 #endif
@@ -512,6 +522,7 @@ namespace ttg_parsec {
         PARSEC_LIST_ITEM_SINGLETON(&parsec_task.super);
         parsec_task.mempool_owner = mempool;
         parsec_task.task_class = task_class;
+        parsec_task.priority = 0;
       }
 
       parsec_ttg_task_base_t(parsec_thread_mempool_t *mempool, parsec_task_class_t *task_class,
@@ -521,6 +532,7 @@ namespace ttg_parsec {
           : data_count(data_count)
           , defer_writer(defer_writer)
           , release_task_cb(release_fn) {
+            int32_t p = priority;
         PARSEC_LIST_ITEM_SINGLETON(&parsec_task.super);
         parsec_task.mempool_owner = mempool;
         parsec_task.task_class = task_class;
@@ -640,7 +652,7 @@ namespace ttg_parsec {
         return i;
       }
       for (i = 0; i < task->data_count; ++i) {
-        auto copy = reinterpret_cast<ttg_data_copy_t *>(task->parsec_task.data[i].data_in);
+        auto copy = static_cast<ttg_data_copy_t *>(task->parsec_task.data[i].data_in);
         if (NULL != copy && copy->device_private == ptr) {
           return i;
         }
@@ -665,7 +677,7 @@ namespace ttg_parsec {
     inline void remove_data_copy(ttg_data_copy_t *copy, parsec_ttg_task_base_t *task) {
       int i;
       /* find and remove entry; copies are usually appended and removed, so start from back */
-      for (i = task->data_count; i >= 0; --i) {
+      for (i = task->data_count-1; i >= 0; --i) {
         if (copy == task->parsec_task.data[i].data_in) {
           break;
         }
@@ -680,10 +692,37 @@ namespace ttg_parsec {
       task->data_count--;
     }
 
+#if defined(TTG_PARSEC_DEBUG_TRACK_DATA_COPIES)
+#warning "ttg::PaRSEC enables data copy tracking"
+    static std::unordered_set<ttg_data_copy_t *> pending_copies;
+    static std::mutex pending_copies_mutex;
+#endif
+#if defined(PARSEC_PROF_TRACE) && defined(PARSEC_TTG_PROFILE_BACKEND)
+    static int64_t parsec_ttg_data_copy_uid = 0;
+#endif
+
     template <typename Value>
     inline ttg_data_copy_t *create_new_datacopy(Value &&value) {
       using value_type = std::decay_t<Value>;
       ttg_data_copy_t *copy = new ttg_data_value_copy_t<value_type>(std::forward<Value>(value));
+#if defined(PARSEC_PROF_TRACE) && defined(PARSEC_TTG_PROFILE_BACKEND)
+      // Keep track of additional memory usage
+      if(ttg::default_execution_context().impl().profiling()) {
+        copy->size = sizeof(Value);
+        copy->uid = parsec_atomic_fetch_inc_int64(&parsec_ttg_data_copy_uid);
+        parsec_profiling_ts_trace_flags(ttg::default_execution_context().impl().parsec_ttg_profile_backend_allocate_datacopy, 
+                                        static_cast<uint64_t>(copy->uid), 
+                                        PROFILE_OBJECT_ID_NULL, &copy->size, 
+                                        PARSEC_PROFILING_EVENT_COUNTER|PARSEC_PROFILING_EVENT_HAS_INFO);
+      }
+#endif
+#if defined(TTG_PARSEC_DEBUG_TRACK_DATA_COPIES)
+      {
+        const std::lock_guard<std::mutex> lock(pending_copies_mutex);
+        auto rc = pending_copies.insert(copy);
+        assert(std::get<1>(rc));
+      }
+#endif
       return copy;
     }
 
@@ -785,6 +824,22 @@ namespace ttg_parsec {
           parsec_ttg_task_base_t *deferred_op = (parsec_ttg_task_base_t *)push_task;
           deferred_op->release_task();
         } else {
+#if defined(TTG_PARSEC_DEBUG_TRACK_DATA_COPIES)
+          {
+            const std::lock_guard<std::mutex> lock(pending_copies_mutex);
+            size_t rc = pending_copies.erase(copy);
+            assert(1 == rc);
+          }
+#endif
+#if defined(PARSEC_PROF_TRACE) && defined(PARSEC_TTG_PROFILE_BACKEND)
+          // Keep track of additional memory usage
+          if(ttg::default_execution_context().impl().profiling()) {
+            parsec_profiling_ts_trace_flags(ttg::default_execution_context().impl().parsec_ttg_profile_backend_free_datacopy, 
+                                            static_cast<uint64_t>(copy->uid), 
+                                            PROFILE_OBJECT_ID_NULL, &copy->size, 
+                                            PARSEC_PROFILING_EVENT_COUNTER|PARSEC_PROFILING_EVENT_HAS_INFO);
+          }
+#endif
           delete copy;
         }
       }
@@ -1498,13 +1553,13 @@ namespace ttg_parsec {
       task_t *newtask;
       parsec_thread_mempool_t *mempool = get_task_mempool();
       char *taskobj = (char *)parsec_thread_mempool_allocate(mempool);
-      int32_t priority;
+      int32_t priority = 0;
       if constexpr (!keyT_is_Void) {
-        priority = priomap(key);
+        //priority = priomap(key);
         /* placement-new the task */
         newtask = new (taskobj) task_t(key, mempool, &this->self, world_impl.taskpool(), this, priority);
       } else {
-        priority = priomap();
+        //priority = priomap();
         /* placement-new the task */
         newtask = new (taskobj) task_t(mempool, &this->self, world_impl.taskpool(), this, priority);
       }
@@ -2723,7 +2778,13 @@ namespace ttg_parsec {
              std::forward<keymapT>(keymap), std::forward<priomapT>(priomap)) {}
 
     // Destructor checks for unexecuted tasks
-    virtual ~TT() { release(); }
+    virtual ~TT() { 
+      if(nullptr != self.name ) {
+        free((void*)self.name);
+        self.name = nullptr;
+      }
+      release(); 
+    }
 
     static void ht_iter_cb(void *item, void *cb_data) {
       task_t *task = (task_t *)item;

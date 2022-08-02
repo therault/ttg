@@ -32,6 +32,7 @@
 
 #include "ttg/parsec/fwd.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstring>
@@ -47,7 +48,6 @@
 #include <string>
 #include <tuple>
 #include <vector>
-#include <algorithm>
 
 #include <parsec.h>
 #include <parsec/class/parsec_hash_table.h>
@@ -140,6 +140,11 @@ namespace ttg_parsec {
     static int get_remote_complete_cb(parsec_comm_engine_t *ce, parsec_ce_tag_t tag, void *msg, size_t msg_size,
                                       int src, void *cb_data);
 
+    inline bool &initialized_mpi() {
+      static bool im = false;
+      return im;
+    }
+
   }  // namespace detail
 
   class WorldImpl : public ttg::base::WorldImplBase {
@@ -170,16 +175,19 @@ namespace ttg_parsec {
 #endif
 
     static constexpr const int PARSEC_TTG_MAX_AM_SIZE = 1024 * 1024;
-    WorldImpl(int *argc, char **argv[], int ncores) : WorldImplBase(query_comm_size(), query_comm_rank())
-#if defined(PARSEC_PROF_TRACE) 
-       , profiling_array(nullptr)
-       , profiling_array_size(0)
+    WorldImpl(int *argc, char **argv[], int ncores, parsec_context_t *c = nullptr)
+        : WorldImplBase(query_comm_size(), query_comm_rank())
+        , ctx(c)
+        , own_ctx(c == nullptr)
+#if defined(PARSEC_PROF_TRACE)
+        , profiling_array(nullptr)
+        , profiling_array_size(0)
 #endif
        , _dag_profiling(false)
        , _task_profiling(false)
     {
       ttg::detail::register_world(*this);
-      ctx = parsec_init(ncores, argc, argv);
+      if (own_ctx) ctx = parsec_init(ncores, argc, argv);
 
 #if defined(PARSEC_PROF_TRACE)
       if(parsec_profile_enabled) {
@@ -263,12 +271,14 @@ namespace ttg_parsec {
     MPI_Comm comm() const { return MPI_COMM_WORLD; }
 
     virtual void execute() override {
-      parsec_enqueue(ctx, tpool);
-      tpool->tdm.module->taskpool_addto_nb_pa(tpool, 1);
-      tpool->tdm.module->taskpool_ready(tpool);
-      int ret = parsec_context_start(ctx);
-      parsec_taskpool_started = true;
-      if (ret != 0) throw std::runtime_error("TTG: parsec_context_start failed");
+      if (!parsec_taskpool_started) {
+        parsec_enqueue(ctx, tpool);
+        tpool->tdm.module->taskpool_addto_nb_pa(tpool, 1);
+        tpool->tdm.module->taskpool_ready(tpool);
+        [[maybe_unused]] auto ret = parsec_context_start(ctx);
+        // ignore ret since all of its nonzero values are OK (e.g. -1 due to ctx already being active)
+        parsec_taskpool_started = true;
+      }
     }
 
     void destroy_tpool() {
@@ -288,7 +298,10 @@ namespace ttg_parsec {
           // We are locally ready (i.e. we won't add new tasks)
           tpool->tdm.module->taskpool_addto_nb_pa(tpool, -1);
           ttg::trace("ttg_parsec(", this->rank(), "): final waiting for completion");
-          parsec_context_wait(ctx);
+          if (own_ctx)
+            parsec_context_wait(ctx);
+          else
+            parsec_taskpool_wait(tpool);
         }
         release_ops();
         ttg::detail::deregister_world(*this);
@@ -302,7 +315,7 @@ namespace ttg_parsec {
           profiling_array_size = 0;
         }
 #endif
-        parsec_fini(&ctx);
+        if (own_ctx) parsec_fini(&ctx);
         mark_invalid();
       }
     }
@@ -418,7 +431,7 @@ namespace ttg_parsec {
       // We are locally ready (i.e. we won't add new tasks)
       tpool->tdm.module->taskpool_addto_nb_pa(tpool, -1);
       ttg::trace("ttg_parsec(", rank, "): waiting for completion");
-      parsec_context_wait(ctx);
+      parsec_taskpool_wait(tpool);
 
       // We need the synchronization between the end of the context and the restart of the taskpool
       // until we use parsec_taskpool_wait and implement an epoch in the PaRSEC taskpool
@@ -432,6 +445,7 @@ namespace ttg_parsec {
 
    private:
     parsec_context_t *ctx = nullptr;
+    bool own_ctx = false;  //< whether I own the context
     parsec_execution_stream_t *es = nullptr;
     parsec_taskpool_t *tpool = nullptr;
     bool parsec_taskpool_started = false;
@@ -943,13 +957,23 @@ namespace ttg_parsec {
 
   inline thread_local detail::parsec_ttg_task_base_t *parsec_ttg_caller;
 
-  template <typename... RestOfArgs>
-  inline void ttg_initialize(int argc, char **argv, int num_threads, RestOfArgs &&...) {
-    int provided;
-    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+  inline void ttg_initialize(int argc, char **argv, int num_threads, parsec_context_t *ctx) {
+    if (detail::initialized_mpi()) throw std::runtime_error("ttg_parsec::ttg_initialize: can only be called once");
+
+    // make sure it's not already initialized
+    int mpi_initialized;
+    MPI_Initialized(&mpi_initialized);
+    if (!mpi_initialized) {  // MPI not initialized? do it, remember that we did it
+      int provided;
+      MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+      if (!provided)
+        throw std::runtime_error("ttg_parsec::ttg_initialize: MPI_Init_thread did not provide MPI_THREAD_MULTIPLE");
+      detail::initialized_mpi() = true;
+    } else {  // no way to test that MPI was initialized with MPI_THREAD_MULTIPLE, cross fingers and proceed
+    }
 
     if (num_threads < 1) num_threads = ttg::detail::num_threads();
-    auto world_ptr = new ttg_parsec::WorldImpl{&argc, &argv, num_threads};
+    auto world_ptr = new ttg_parsec::WorldImpl{&argc, &argv, num_threads, ctx};
     std::shared_ptr<ttg::base::WorldImplBase> world_sptr{static_cast<ttg::base::WorldImplBase *>(world_ptr)};
     ttg::World world{std::move(world_sptr)};
     ttg::detail::set_default_world(std::move(world));
@@ -961,7 +985,7 @@ namespace ttg_parsec {
       ttg::default_execution_context().impl().final_task();
     ttg::detail::set_default_world(ttg::World{});  // reset the default world
     ttg::detail::destroy_worlds<ttg_parsec::WorldImpl>();
-    MPI_Finalize();
+    if (detail::initialized_mpi()) MPI_Finalize();
   }
   inline ttg::World ttg_default_execution_context() { return ttg::get_default_world(); }
   inline void ttg_abort() { MPI_Abort(ttg_default_execution_context().impl().comm(), 1); }

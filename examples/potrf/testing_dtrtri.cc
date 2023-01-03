@@ -92,10 +92,10 @@ int main(int argc, char **argv)
 
   std::cout << "Creating 2D block cyclic matrix with NB " << NB << " N " << N << " M " << M << " P " << P << std::endl;
 
-  sym_two_dim_block_cyclic_t dcA;
-  sym_two_dim_block_cyclic_init(&dcA, matrix_type::matrix_RealDouble,
-                                world.size(), world.rank(), NB, NB, N, M,
-                                0, 0, N, M, P, uplo == lapack::Uplo::Lower ? matrix_Lower : matrix_Upper);
+  parsec_matrix_sym_block_cyclic_t dcA;
+  parsec_matrix_sym_block_cyclic_init(&dcA, parsec_matrix_type_t::PARSEC_MATRIX_DOUBLE,
+                                world.rank(), NB, NB, N, M,
+                                0, 0, N, M, P, Q, uplo == lapack::Uplo::Lower ? PARSEC_MATRIX_LOWER : PARSEC_MATRIX_UPPER);
   dcA.mat = parsec_data_allocate((size_t)dcA.super.nb_local_tiles *
                                  (size_t)dcA.super.bsiz *
                                  (size_t)parsec_datadist_getsizeoftype(dcA.super.mtype));
@@ -222,13 +222,45 @@ int main(int argc, char **argv)
   }
 
   parsec_data_free(dcA.mat); dcA.mat = NULL;
-  parsec_tiled_matrix_dc_destroy( (parsec_tiled_matrix_dc_t*)&dcA);
+  parsec_tiled_matrix_destroy( (parsec_tiled_matrix_t*)&dcA);
 
   world.dag_off();
   world.profile_off();
 
   ttg::finalize();
   return ret;
+}
+
+static void
+dplasma_dprint_tile( int m, int n,
+                     const parsec_tiled_matrix_t* descA,
+                     const double *M )
+{
+    int tempmm = ( m == descA->mt-1 ) ? descA->m - m*descA->mb : descA->mb;
+    int tempnn = ( n == descA->nt-1 ) ? descA->n - n*descA->nb : descA->nb;
+    int ldam = BLKLDD( descA, m );
+
+    int ii, jj;
+
+    fflush(stdout);
+    for(ii=0; ii<tempmm; ii++) {
+        if ( ii == 0 )
+            fprintf(stdout, "(%2d, %2d) :", m, n);
+        else
+            fprintf(stdout, "          ");
+        for(jj=0; jj<tempnn; jj++) {
+#if defined(PRECISION_z) || defined(PRECISION_c)
+            fprintf(stdout, " (% e, % e)",
+                    creal( M[jj*ldam + ii] ),
+                    cimag( M[jj*ldam + ii] ));
+#else
+            fprintf(stdout, " % e", M[jj*ldam + ii]);
+#endif
+        }
+        fprintf(stdout, "\n");
+    }
+    fflush(stdout);
+    usleep(1000);
 }
 
 int check_dtrtri( lapack::Diag diag, lapack::Uplo uplo, double *A, double *Ainv, int N )

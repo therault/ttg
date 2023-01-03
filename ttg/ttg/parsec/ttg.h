@@ -264,7 +264,7 @@ namespace ttg_parsec {
       // be added by the main thread. It should then be initialized
       // to 0, execute will set it to 1 and mark the tpool as ready,
       // and the fence() will decrease it back to 0.
-      tpool->tdm.module->taskpool_set_nb_pa(tpool, 0);
+      tpool->tdm.module->taskpool_set_runtime_actions(tpool, 0);
       parsec_taskpool_enable(tpool, NULL, NULL, es, size() > 1);
 
 #if defined(PARSEC_PROF_TRACE)
@@ -302,7 +302,7 @@ namespace ttg_parsec {
     virtual void execute() override {
       if (!parsec_taskpool_started) {
         parsec_enqueue(ctx, tpool);
-        tpool->tdm.module->taskpool_addto_nb_pa(tpool, 1);
+        tpool->tdm.module->taskpool_addto_runtime_actions(tpool, 1);
         tpool->tdm.module->taskpool_ready(tpool);
         [[maybe_unused]] auto ret = parsec_context_start(ctx);
         // ignore ret since all of its nonzero values are OK (e.g. -1 due to ctx already being active)
@@ -327,7 +327,7 @@ namespace ttg_parsec {
       if (is_valid()) {
         if (parsec_taskpool_started) {
           // We are locally ready (i.e. we won't add new tasks)
-          tpool->tdm.module->taskpool_addto_nb_pa(tpool, -1);
+          tpool->tdm.module->taskpool_addto_runtime_actions(tpool, -1);
           ttg::trace("ttg_parsec(", this->rank(), "): final waiting for completion");
           if (own_ctx)
             parsec_context_wait(ctx);
@@ -364,8 +364,8 @@ namespace ttg_parsec {
 
     void increment_created() { taskpool()->tdm.module->taskpool_addto_nb_tasks(taskpool(), 1); }
 
-    void increment_inflight_msg() { taskpool()->tdm.module->taskpool_addto_nb_pa(taskpool(), 1); }
-    void decrement_inflight_msg() { taskpool()->tdm.module->taskpool_addto_nb_pa(taskpool(), -1); }
+    void increment_inflight_msg() { taskpool()->tdm.module->taskpool_addto_runtime_actions(taskpool(), 1); }
+    void decrement_inflight_msg() { taskpool()->tdm.module->taskpool_addto_runtime_actions(taskpool(), -1); }
 
     bool dag_profiling() override { return _dag_profiling; }
 
@@ -466,7 +466,7 @@ namespace ttg_parsec {
       }
       ttg::trace("ttg_parsec::(", rank, "): parsec taskpool is ready for completion");
       // We are locally ready (i.e. we won't add new tasks)
-      tpool->tdm.module->taskpool_addto_nb_pa(tpool, -1);
+      tpool->tdm.module->taskpool_addto_runtime_actions(tpool, -1);
       ttg::trace("ttg_parsec(", rank, "): waiting for completion");
       parsec_taskpool_wait(tpool);
 
@@ -602,7 +602,7 @@ namespace ttg_parsec {
         parsec_task.status = PARSEC_TASK_STATUS_HOOK;
         parsec_task.taskpool = taskpool;
         parsec_task.priority = priority;
-        parsec_task.chore_id = 0;
+        parsec_task.chore_mask = 1<<0;
       }
 
     public:

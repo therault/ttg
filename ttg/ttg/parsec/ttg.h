@@ -177,8 +177,7 @@ namespace ttg_parsec {
   }  // namespace detail
 
   class WorldImpl : public ttg::base::WorldImplBase {
-    static constexpr const int _PARSEC_TTG_TAG = 10;      // This TAG should be 'allocated' at the PaRSEC level
-    static constexpr const int _PARSEC_TTG_RMA_TAG = 11;  // This TAG should be 'allocated' at the PaRSEC level
+    int32_t parsec_comm_engine_cb_idx;
 
     ttg::Edge<> m_ctl_edge;
     bool _dag_profiling;
@@ -194,6 +193,18 @@ namespace ttg_parsec {
       int comm_rank;
       MPI_Comm_rank(MPI_COMM_WORLD, &comm_rank);
       return comm_rank;
+    }
+
+    static void ttg_parsec_ce_up(parsec_comm_engine_t *comm_engine, void *user_data)
+    {
+      parsec_ce.tag_register(WorldImpl::parsec_ttg_tag(), &detail::static_unpack_msg, user_data, PARSEC_TTG_MAX_AM_SIZE);
+      parsec_ce.tag_register(WorldImpl::parsec_ttg_rma_tag(), &detail::get_remote_complete_cb, user_data, 128);
+    }
+
+    static void ttg_parsec_ce_down(parsec_comm_engine_t *comm_engine, void *user_data)
+    {
+      parsec_ce.tag_unregister(WorldImpl::parsec_ttg_tag());
+      parsec_ce.tag_unregister(WorldImpl::parsec_ttg_rma_tag());
     }
 
    public:
@@ -238,19 +249,18 @@ namespace ttg_parsec {
 
       es = ctx->virtual_processes[0]->execution_streams[0];
 
-      parsec_ce.tag_register(_PARSEC_TTG_TAG, &detail::static_unpack_msg, this, PARSEC_TTG_MAX_AM_SIZE);
-      parsec_ce.tag_register(_PARSEC_TTG_RMA_TAG, &detail::get_remote_complete_cb, this, 128);
+      parsec_comm_engine_cb_idx = parsec_comm_engine_register_callback(ttg_parsec_ce_up, this, ttg_parsec_ce_down, this);
 
       create_tpool();
     }
 
     void create_tpool() {
       assert(nullptr == tpool);
-      tpool = (parsec_taskpool_t *)calloc(1, sizeof(parsec_taskpool_t));
+      tpool = PARSEC_OBJ_NEW(parsec_taskpool_t);
       tpool->taskpool_id = -1;
       tpool->update_nb_runtime_task = parsec_add_fetch_runtime_task;
       tpool->taskpool_type = PARSEC_TASKPOOL_TYPE_TTG;
-      tpool->taskpool_name = (char*)"TTG Taskpool";
+      tpool->taskpool_name = strdup("TTG Taskpool");
       parsec_taskpool_reserve_id(tpool);
 
 #ifdef TTG_USE_USER_TERMDET
@@ -294,8 +304,8 @@ namespace ttg_parsec {
 
     ~WorldImpl() { destroy(); }
 
-    static constexpr int parsec_ttg_tag() { return _PARSEC_TTG_TAG; }
-    static constexpr int parsec_ttg_rma_tag() { return _PARSEC_TTG_RMA_TAG; }
+    static constexpr int parsec_ttg_tag() { return PARSEC_DSL_TTG_TAG; }
+    static constexpr int parsec_ttg_rma_tag() { return PARSEC_DSL_TTG_RMA_TAG; }
 
     MPI_Comm comm() const { return MPI_COMM_WORLD; }
 
@@ -338,9 +348,9 @@ namespace ttg_parsec {
         ttg::detail::deregister_world(*this);
         destroy_tpool();
         if (own_ctx) {
-          unregister_parsec_tags(nullptr);
+          unregister_parsec_tags(&parsec_comm_engine_cb_idx);
         } else {
-          parsec_context_at_fini(unregister_parsec_tags, nullptr);
+          parsec_context_at_fini(unregister_parsec_tags, &parsec_comm_engine_cb_idx);
         }
 #if defined(PARSEC_PROF_TRACE)
         if(nullptr != profiling_array) {
@@ -492,10 +502,11 @@ namespace ttg_parsec {
 #endif
   };
 
-  static void unregister_parsec_tags(void *_)
+  static void unregister_parsec_tags(void *_pidx)
   {
-    parsec_ce.tag_unregister(WorldImpl::parsec_ttg_tag());
-    parsec_ce.tag_unregister(WorldImpl::parsec_ttg_rma_tag());
+    int32_t *pidx = static_cast<int32_t*>(_pidx);
+    parsec_comm_engine_unregister_callback(*pidx);
+    *pidx = 0;
   }
 
   namespace detail {

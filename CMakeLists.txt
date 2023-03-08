@@ -86,19 +86,20 @@ include(FindOrFetchBoost)
 # C++ coroutines
 find_package(CXXStdCoroutine MODULE REQUIRED COMPONENTS Final Experimental)
 
-
 ##########################
-#### CUDA: must come before PaRSEC
+#### CUDA -- CUDA language must be added before PaRSEC detects CUDA
 ##########################
-include(CheckLanguage)
-check_language(CUDA)
-if(CMAKE_CUDA_COMPILER)
+option(TTG_DISABLE_CUDA "True iff support for CUDA files is disabled, even if it is possible" OFF)
+if( NOT TTG_DISABLE_CUDA )
+  include(CheckLanguage)
+  check_language(CUDA)
+  if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
-endif(CMAKE_CUDA_COMPILER)
-set(TTG_HAVE_CUDA ${CMAKE_CUDA_COMPILER} CACHE BOOL "True if TTG supports compiling .cu files")
-
-
-
+  endif(CMAKE_CUDA_COMPILER)
+  set(TTG_HAVE_CUDA ${CMAKE_CUDA_COMPILER} CACHE BOOL "True if TTG supports compiling .cu files")
+else( NOT TTG_DISABLE_CUDA )
+  set(TTG_HAVE_CUDA OFF CACHE BOOL "True if TTG supports compiling .cu files")
+endif( NOT TTG_DISABLE_CUDA )
 
 ##########################
 #### prerequisite runtimes
@@ -113,7 +114,6 @@ include(FindOrFetchMADNESS)
 if (TARGET MADworld)
   message(STATUS "MADNESS_FOUND=1")
 endif(TARGET MADworld)
-
 
 ##########################
 #### Examples

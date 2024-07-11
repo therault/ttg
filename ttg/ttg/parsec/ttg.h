@@ -39,6 +39,7 @@
 #ifdef TTG_HAVE_DEVICE
 #include "ttg/device/task.h"
 #endif  // TTG_HAVE_DEVICE
+#include "parsec/utils/mca_param.h"
 
 #include "ttg/serialization/data_descriptor.h"
 
@@ -67,6 +68,8 @@
 #include <string>
 #include <tuple>
 #include <vector>
+#include <bitset>
+#include <regex>
 
 // needed for MPIX_CUDA_AWARE_SUPPORT
 #if defined(TTG_HAVE_MPI)
@@ -171,7 +174,7 @@ namespace ttg_parsec {
     int64_t size;
   } parsec_ttg_comm_profiling_info_t;
 
-  static const char *parsec_ttg_comm_profiling_info_convertor = "peer{int};size{int_64_t}";
+  static const char *parsec_ttg_comm_profiling_info_convertor = "peer{int};size{int64_t}";
 #endif
 
   static void unregister_parsec_tags(void *_);
@@ -202,25 +205,18 @@ namespace ttg_parsec {
     // Those need to be static as the unpack function is static
     static int parsec_ttg_profile_comm_recv_am_begin, parsec_ttg_profile_comm_recv_am_end;
     static int parsec_ttg_profile_comm_get_begin, parsec_ttg_profile_comm_get_end;
+    static void static_profile_comm_unpack(int src_rank, int64_t size, bool start);
 #endif
-
     static int static_unpack_msg(parsec_comm_engine_t *ce, uint64_t tag, void *data, long unsigned int size,
                                  int src_rank, void *obj) {
       int ret;
-#if defined(PARSEC_PROF_TRACE)
-      if( parsec_profile_enabled ) {
-        parsec_ttg_comm_profiling_info_t cpi = {src_rank, static_cast<int64_t>(size)};
-        parsec_profiling_ts_trace_flags_info_fn(parsec_ttg_profile_comm_recv_am_begin,
-                                        0,
-                                        PROFILE_OBJECT_ID_NULL, std::memcpy, &cpi,
-                                        PARSEC_PROFILING_EVENT_HAS_INFO|
-                                        PARSEC_PROFILING_EVENT_TIME_AT_END);
-      }
-#endif
       static_set_arg_fct_type static_set_arg_fct;
       parsec_taskpool_t *tp = NULL;
       msg_header_t *msg = static_cast<msg_header_t *>(data);
       uint64_t op_id = msg->op_id;
+#if defined(PARSEC_PROF_TRACE)
+      static_profile_comm_unpack(src_rank, static_cast<int64_t>(size), true);
+#endif
       tp = parsec_taskpool_lookup(msg->taskpool_id);
       assert(NULL != tp);
       static_map_mutex.lock();
@@ -243,14 +239,7 @@ namespace ttg_parsec {
         ret = 1;
       }
 #if defined(PARSEC_PROF_TRACE)
-      if( parsec_profile_enabled ) {
-        parsec_ttg_comm_profiling_info_t cpi = {src_rank, static_cast<int64_t>(size)};
-        parsec_profiling_ts_trace_flags_info_fn(parsec_ttg_profile_comm_recv_am_end,
-                                        0,
-                                        PROFILE_OBJECT_ID_NULL, std::memcpy, &cpi,
-                                        PARSEC_PROFILING_EVENT_HAS_INFO|
-                                        PARSEC_PROFILING_EVENT_TIME_AT_START);
-      }
+      static_profile_comm_unpack(src_rank, static_cast<int64_t>(size), false);
 #endif
       return ret;
     }
@@ -267,8 +256,6 @@ namespace ttg_parsec {
 
   class WorldImpl : public ttg::base::WorldImplBase {
     ttg::Edge<> m_ctl_edge;
-    bool _dag_profiling;
-    bool _task_profiling;
     std::array<bool, static_cast<std::size_t>(ttg::ExecutionSpace::Invalid)>
                mpi_space_support = {true, false, false};
 
@@ -297,6 +284,18 @@ namespace ttg_parsec {
     }
 
    public:
+    typedef enum {
+      PROFILE_TASKS,
+      PROFILE_DAG,
+      PROFILE_BACKEND_SET_ARG,
+      PROFILE_BACKEND_BCAST,
+      PROFILE_BACKEND_DATACOPY,
+      PROFILE_BACKEND_COMM_SEND_AM,
+      PROFILE_BACKEND_COMM_RECV_AM,
+      PROFILE_BACKEND_COMM_GET,
+      PROFILE_OPTIONS_LAST
+    } profiling_options_t;
+
     int parsec_ttg_profile_backend_set_arg_start, parsec_ttg_profile_backend_set_arg_end;
     int parsec_ttg_profile_backend_bcast_arg_start, parsec_ttg_profile_backend_bcast_arg_end;
     int parsec_ttg_profile_backend_allocate_datacopy, parsec_ttg_profile_backend_free_datacopy;
@@ -308,8 +307,7 @@ namespace ttg_parsec {
         , own_ctx(c == nullptr)
         , profiling_array(nullptr)
         , profiling_array_size(0)
-       , _dag_profiling(false)
-       , _task_profiling(false)
+        , _profiling()
     {
       ttg::detail::register_world(*this);
       if (own_ctx) ctx = parsec_init(ncores, argc, argv);
@@ -334,28 +332,41 @@ namespace ttg_parsec {
 #if defined(PARSEC_PROF_TRACE)
       if(parsec_profile_enabled) {
         profile_on();
-        parsec_profiling_add_dictionary_keyword("PARSEC_TTG_SET_ARG_IMPL", "fill:000000", 0, NULL,
-                                                (int*)&parsec_ttg_profile_backend_set_arg_start,
-                                                (int*)&parsec_ttg_profile_backend_set_arg_end);
-        parsec_profiling_add_dictionary_keyword("PARSEC_TTG_BCAST_ARG_IMPL", "fill:000000", 0, NULL,
-                                                (int*)&parsec_ttg_profile_backend_bcast_arg_start,
-                                                (int*)&parsec_ttg_profile_backend_bcast_arg_end);
-        parsec_profiling_add_dictionary_keyword("PARSEC_TTG_DATACOPY", "fill:000000",
-                                                sizeof(int64_t), "size{int64_t}",
-                                                (int*)&parsec_ttg_profile_backend_allocate_datacopy,
-                                                (int*)&parsec_ttg_profile_backend_free_datacopy);
-        parsec_profiling_add_dictionary_keyword("PARSEC_TTG_COMM_SEND_AM", "fill:000000",
-                                                sizeof(parsec_ttg_comm_profiling_info_t), parsec_ttg_comm_profiling_info_convertor,
-                                                (int*)&parsec_ttg_profile_comm_send_am_begin,
-                                                (int*)&parsec_ttg_profile_comm_send_am_end);
-        parsec_profiling_add_dictionary_keyword("PARSEC_TTG_COMM_RECEIVED_AM", "fill:000000",
-                                                sizeof(parsec_ttg_comm_profiling_info_t), parsec_ttg_comm_profiling_info_convertor,
-                                                (int*)&ttg_parsec::detail::parsec_ttg_profile_comm_recv_am_begin,
-                                                (int*)&ttg_parsec::detail::parsec_ttg_profile_comm_recv_am_end);
-        parsec_profiling_add_dictionary_keyword("PARSEC_TTG_COMM_GET", "fill:000000",
-                                                sizeof(parsec_ttg_comm_profiling_info_t), parsec_ttg_comm_profiling_info_convertor,
-                                                (int*)&ttg_parsec::detail::parsec_ttg_profile_comm_get_begin,
-                                                (int*)&ttg_parsec::detail::parsec_ttg_profile_comm_get_end);
+        profile_parse_enabled_backend_events();
+        if(profiling(WorldImpl::PROFILE_BACKEND_SET_ARG)) {
+          parsec_profiling_add_dictionary_keyword("PARSEC_TTG_SET_ARG_IMPL", "fill:000000", 0, NULL,
+                                                  (int*)&parsec_ttg_profile_backend_set_arg_start,
+                                                  (int*)&parsec_ttg_profile_backend_set_arg_end);
+        }
+        if(profiling(WorldImpl::PROFILE_BACKEND_BCAST)) {
+          parsec_profiling_add_dictionary_keyword("PARSEC_TTG_BCAST_ARG_IMPL", "fill:000000", 0, NULL,
+                                                  (int*)&parsec_ttg_profile_backend_bcast_arg_start,
+                                                  (int*)&parsec_ttg_profile_backend_bcast_arg_end);
+        }
+        if(profiling(WorldImpl::PROFILE_BACKEND_DATACOPY)) {
+          parsec_profiling_add_dictionary_keyword("PARSEC_TTG_DATACOPY", "fill:000000",
+                                                  sizeof(int64_t), "size{int64_t}",
+                                                  (int*)&parsec_ttg_profile_backend_allocate_datacopy,
+                                                  (int*)&parsec_ttg_profile_backend_free_datacopy);
+        }
+        if(profiling(WorldImpl::PROFILE_BACKEND_COMM_SEND_AM)) {
+          parsec_profiling_add_dictionary_keyword("PARSEC_TTG_COMM_SEND_AM", "fill:000000",
+                                                  sizeof(parsec_ttg_comm_profiling_info_t), parsec_ttg_comm_profiling_info_convertor,
+                                                  (int*)&parsec_ttg_profile_comm_send_am_begin,
+                                                  (int*)&parsec_ttg_profile_comm_send_am_end);
+        }
+        if(profiling(WorldImpl::PROFILE_BACKEND_COMM_RECV_AM)) {
+          parsec_profiling_add_dictionary_keyword("PARSEC_TTG_COMM_RECEIVED_AM", "fill:000000",
+                                                  sizeof(parsec_ttg_comm_profiling_info_t), parsec_ttg_comm_profiling_info_convertor,
+                                                  (int*)&ttg_parsec::detail::parsec_ttg_profile_comm_recv_am_begin,
+                                                  (int*)&ttg_parsec::detail::parsec_ttg_profile_comm_recv_am_end);
+        }
+        if(profiling(WorldImpl::PROFILE_BACKEND_COMM_GET)) {
+          parsec_profiling_add_dictionary_keyword("PARSEC_TTG_COMM_GET", "fill:000000",
+                                                  sizeof(parsec_ttg_comm_profiling_info_t), parsec_ttg_comm_profiling_info_convertor,
+                                                  (int*)&ttg_parsec::detail::parsec_ttg_profile_comm_get_begin,
+                                                  (int*)&ttg_parsec::detail::parsec_ttg_profile_comm_get_end);
+        }
       }
 #endif
 
@@ -496,17 +507,17 @@ namespace ttg_parsec {
     void increment_inflight_msg() { taskpool()->tdm.module->taskpool_addto_runtime_actions(taskpool(), 1); }
     void decrement_inflight_msg() { taskpool()->tdm.module->taskpool_addto_runtime_actions(taskpool(), -1); }
 
-    bool dag_profiling() override { return _dag_profiling; }
+    bool dag_profiling() override { return _profiling.test(PROFILE_DAG); }
 
     virtual void dag_on(const std::string &filename) override {
 #if defined(PARSEC_PROF_GRAPHER)
-      if(!_dag_profiling) {
+      if(!_profiling.test(PROFILE_DAG)) {
         profile_on();
         size_t len = strlen(filename.c_str())+32;
         char ext_filename[len];
         snprintf(ext_filename, len, "%s-%d.dot", filename.c_str(), rank());
         parsec_prof_grapher_init(ctx, ext_filename);
-        _dag_profiling = true;
+        _profiling.set(PROFILE_DAG);
       }
 #else
       ttg::print("Error: requested to create '", filename, "' to create a DAG of tasks,\n"
@@ -516,22 +527,29 @@ namespace ttg_parsec {
 
     virtual void dag_off() override {
 #if defined(PARSEC_PROF_GRAPHER)
-      if(_dag_profiling) {
+      if(_profiling.test(PROFILE_DAG)) {
         parsec_prof_grapher_fini();
-        _dag_profiling = false;
+        _profiling.reset(PROFILE_DAG);
       }
 #endif
     }
 
+    void profile_off(profiling_options_t opt) {
+      _profiling.reset(opt);
+    }
     virtual void profile_off() override {
-      _task_profiling = false;
+      profile_off(PROFILE_TASKS);
     }
 
+    void profile_on(profiling_options_t opt) {
+      _profiling.set(opt);
+    }
     virtual void profile_on() override {
-      _task_profiling = true;
+      profile_on(PROFILE_TASKS);
     }
 
-    virtual bool profiling() override { return _task_profiling; }
+    bool profiling(profiling_options_t opt) { return _profiling.test(opt); }
+    virtual bool profiling() override { return profiling(PROFILE_TASKS); }
 
     bool mpi_support(ttg::ExecutionSpace space) {
       return mpi_space_support[static_cast<std::size_t>(space)];
@@ -549,7 +567,7 @@ namespace ttg_parsec {
     template <typename keyT, typename output_terminalsT, typename derivedT, typename input_valueTs = ttg::typelist<>>
     void register_tt_profiling(const TT<keyT, output_terminalsT, derivedT, input_valueTs> *t) {
 #if defined(PARSEC_PROF_TRACE)
-      if(parsec_profile_enabled) {
+      if(profiling()) {
         std::stringstream ss;
         build_composite_name_rec(t->ttg_ptr(), ss);
         ss << t->get_name();
@@ -585,6 +603,41 @@ namespace ttg_parsec {
 #endif
     }
 
+#if defined(PARSEC_PROF_TRACE)
+    void profile_parse_enabled_backend_events() {
+      char *selected_profile_backend;
+      std::map<profiling_options_t, std::string> backend_features{
+        {PROFILE_BACKEND_SET_ARG, "SET_ARG"},
+        {PROFILE_BACKEND_BCAST, "BCAST"},
+        {PROFILE_BACKEND_DATACOPY, "DATA_COPY"},
+        {PROFILE_BACKEND_COMM_SEND_AM, "COMM_SEND_AM"},
+        {PROFILE_BACKEND_COMM_RECV_AM, "COMM_RECV_AM"},
+        {PROFILE_BACKEND_COMM_GET, "COMM_GET"}};
+      std::stringstream help("Which type of events of the PaRSEC backend should be profiled during execution (possible features: ");
+      bool first = true;
+      for (auto const& x : backend_features) {
+        if(!first) help << ", ";
+        help << x.second;
+        first = false;
+      }
+      help << "); regular expressions are accepted, so 'COMM_,SET_ARG' would enable SET_ARG and all COMM_ feature.";
+      parsec_mca_param_reg_string_name("ttg", "backend_profile_events",
+                                       help.str().c_str(),
+                                       false, false, "", &selected_profile_backend);
+      std::stringstream sel(selected_profile_backend);
+      std::string expr;
+      while(std::getline(sel, expr, ',')) {
+        std::regex self_regex(expr, std::regex_constants::ECMAScript | std::regex_constants::icase);
+        for(auto const &x : backend_features) {
+          if (std::regex_search(x.second, self_regex)) {
+            profile_on(x.first);
+          }
+        }
+      }
+      free(selected_profile_backend);
+    }
+#endif
+
     virtual void fence_impl(void) override {
       int rank = this->rank();
       if (!parsec_taskpool_started) {
@@ -615,6 +668,7 @@ namespace ttg_parsec {
     bool parsec_taskpool_started = false;
     int        *profiling_array;
     std::size_t profiling_array_size;
+    std::bitset<PROFILE_OPTIONS_LAST> _profiling;
   };
 
   static void unregister_parsec_tags(void *_pidx)
@@ -626,6 +680,27 @@ namespace ttg_parsec {
   }
 
   namespace detail {
+
+#if defined(PARSEC_PROF_TRACE)
+    static void static_profile_comm_unpack(int src_rank, int64_t size, bool start) {
+        if( ttg::default_execution_context().impl().profiling(WorldImpl::PROFILE_BACKEND_COMM_RECV_AM) ) {
+          parsec_ttg_comm_profiling_info_t cpi = {src_rank, static_cast<int64_t>(size)};
+          if(start) {
+            parsec_profiling_ts_trace_flags_info_fn(parsec_ttg_profile_comm_recv_am_begin,
+                                            0,
+                                            PROFILE_OBJECT_ID_NULL, std::memcpy, &cpi,
+                                            PARSEC_PROFILING_EVENT_HAS_INFO|
+                                            PARSEC_PROFILING_EVENT_TIME_AT_END);
+          } else {
+            parsec_profiling_ts_trace_flags_info_fn(parsec_ttg_profile_comm_recv_am_end,
+                                            0,
+                                            PROFILE_OBJECT_ID_NULL, std::memcpy, &cpi,
+                                            PARSEC_PROFILING_EVENT_HAS_INFO|
+                                            PARSEC_PROFILING_EVENT_TIME_AT_START);
+          }
+        }
+    }
+#endif
 
     const parsec_symbol_t parsec_taskclass_param0 = {
       .flags = PARSEC_SYMBOL_IS_STANDALONE|PARSEC_SYMBOL_IS_GLOBAL,
@@ -741,8 +816,8 @@ namespace ttg_parsec {
         throw std::logic_error("Trying to copy-construct data that is not copy-constructible!");
       }
 #if defined(PARSEC_PROF_TRACE)
-      // Keep track of additional memory usage
-      if(ttg::default_execution_context().impl().profiling()) {
+      if(ttg::default_execution_context().impl().profiling(WorldImpl::PROFILE_BACKEND_DATACOPY)) {
+        // Keep track of additional memory usage
         copy->size = sizeof(Value);
         copy->uid = parsec_atomic_fetch_inc_int64(&parsec_ttg_data_copy_uid);
         parsec_profiling_ts_trace_flags_info_fn(ttg::default_execution_context().impl().parsec_ttg_profile_backend_allocate_datacopy,
@@ -892,7 +967,7 @@ namespace ttg_parsec {
         delete activation;
       }
 #if defined(PARSEC_PROF_TRACE)
-      if( parsec_profile_enabled ) {
+      if( ttg::default_execution_context().impl().profiling(WorldImpl::PROFILE_BACKEND_COMM_GET) ) {
         parsec_ttg_comm_profiling_info_t cpi = {remote, static_cast<int64_t>(size)};
         parsec_profiling_ts_trace_flags_info_fn(parsec_ttg_profile_comm_get_end,
                                         0,
@@ -963,7 +1038,7 @@ namespace ttg_parsec {
 #endif
 #if defined(PARSEC_PROF_TRACE)
           // Keep track of additional memory usage
-          if(ttg::default_execution_context().impl().profiling()) {
+          if(ttg::default_execution_context().impl().profiling(WorldImpl::PROFILE_BACKEND_DATACOPY)) {
             parsec_profiling_ts_trace_flags_info_fn(ttg::default_execution_context().impl().parsec_ttg_profile_backend_free_datacopy,
                                             static_cast<uint64_t>(copy->uid),
                                             PROFILE_OBJECT_ID_NULL, std::memcpy, &copy->size,
@@ -1406,7 +1481,7 @@ namespace ttg_parsec {
       parsec_taskpool_t *tp = world_impl.taskpool();
 
 #if defined(PARSEC_PROF_TRACE)
-      if( parsec_profile_enabled ) {
+      if( ttg::default_execution_context().impl().profiling(WorldImpl::PROFILE_BACKEND_COMM_SEND_AM) ) {
         parsec_ttg_comm_profiling_info_t cpi = {dest, static_cast<int64_t>(size)};
         parsec_profiling_ts_trace_flags_info_fn(world_impl.parsec_ttg_profile_comm_send_am_begin,
                                         0,
@@ -1421,7 +1496,7 @@ namespace ttg_parsec {
       parsec_ce.send_am(&parsec_ce, world_impl.parsec_ttg_tag(), dest, static_cast<void *>(msg.get()), size);
 
 #if defined(PARSEC_PROF_TRACE)
-      if( parsec_profile_enabled ) {
+      if( ttg::default_execution_context().impl().profiling(WorldImpl::PROFILE_BACKEND_COMM_SEND_AM) ) {
         parsec_ttg_comm_profiling_info_t cpi = {dest, static_cast<int64_t>(size)};
         parsec_profiling_ts_trace_flags_info_fn(world_impl.parsec_ttg_profile_comm_send_am_end,
                                         0,
@@ -2254,7 +2329,7 @@ namespace ttg_parsec {
                     pos += sizeof(fn_ptr);
 
 #if defined(PARSEC_PROF_TRACE)
-                    if( parsec_profile_enabled ) {
+                    if( ttg::default_execution_context().impl().profiling(WorldImpl::PROFILE_BACKEND_COMM_GET) ) {
                       parsec_ttg_comm_profiling_info_t cpi = {remote, static_cast<int64_t>(iov.num_bytes)};
                       parsec_profiling_ts_trace_flags_info_fn(ttg_parsec::detail::parsec_ttg_profile_comm_get_begin,
                                                       0,
@@ -2845,7 +2920,7 @@ namespace ttg_parsec {
       using norefvalueT = std::remove_reference_t<Value>;
       norefvalueT *value_ptr = &value;
 
-      if(world.impl().profiling()) {
+      if(world.impl().profiling(WorldImpl::PROFILE_BACKEND_SET_ARG)) {
         parsec_profiling_ts_trace_flags_info_fn(world.impl().parsec_ttg_profile_backend_set_arg_start, 0, 0, NULL, NULL, PARSEC_PROFILING_EVENT_TIME_AT_END);
       }
 
@@ -2858,7 +2933,7 @@ namespace ttg_parsec {
           set_arg_local_impl<i>(key, std::forward<Value>(value), copy_in);
         else
           set_arg_local_impl<i>(ttg::Void{}, std::forward<Value>(value), copy_in);
-          if(world.impl().profiling()) {
+          if(world.impl().profiling(WorldImpl::PROFILE_BACKEND_SET_ARG)) {
             parsec_profiling_ts_trace_flags_info_fn(world.impl().parsec_ttg_profile_backend_set_arg_end, 0, 0, NULL, NULL, PARSEC_PROFILING_EVENT_TIME_AT_START);
           }
         return;
@@ -2977,7 +3052,7 @@ namespace ttg_parsec {
 
       //std::cout << "set_arg_impl send_msg owner " << owner << " sender " << msg->tt_id.sender << std::endl;
       send_msg(owner, std::move(msg), sizeof(msg_header_t) + pos);
-      if(world.impl().profiling()) {
+      if(world.impl().profiling(WorldImpl::PROFILE_BACKEND_SET_ARG)) {
         parsec_profiling_ts_trace_flags_info_fn(world.impl().parsec_ttg_profile_backend_set_arg_end, 0, 0, NULL, NULL, PARSEC_PROFILING_EVENT_TIME_AT_START);
       }
 #if defined(PARSEC_PROF_GRAPHER)
@@ -3004,7 +3079,7 @@ namespace ttg_parsec {
 
     template <int i, typename Iterator, typename Value>
     void broadcast_arg_local(Iterator &&begin, Iterator &&end, const Value &value) {
-      if(world.impl().profiling()) {
+      if(world.impl().profiling(WorldImpl::PROFILE_BACKEND_BCAST)) {
         parsec_profiling_ts_trace_flags_info_fn(world.impl().parsec_ttg_profile_backend_bcast_arg_start, 0, 0, NULL, NULL, PARSEC_PROFILING_EVENT_TIME_AT_END);
       }
       parsec_task_t *task_ring = nullptr;
@@ -3021,7 +3096,7 @@ namespace ttg_parsec {
         parsec_task_t *vp_task_ring[1] = { task_ring };
         __parsec_schedule_vp(world.impl().execution_stream(), vp_task_ring, 0);
       }
-      if(world.impl().profiling()) {
+      if(world.impl().profiling(WorldImpl::PROFILE_BACKEND_SET_ARG)) {
         parsec_profiling_ts_trace_flags_info_fn(world.impl().parsec_ttg_profile_backend_set_arg_end, 0, 0, NULL, NULL, PARSEC_PROFILING_EVENT_TIME_AT_START);
       }
     }
@@ -3953,7 +4028,7 @@ namespace ttg_parsec {
       self.nb_flows = MAX_PARAM_COUNT; // we're not using all flows but have to
                                        // trick the device handler into looking at all of them
 
-      if( world_impl.profiling() ) {
+      if( world_impl.profiling(WorldImpl::PROFILE_TASKS) ) {
         // first two ints are used to store the hash of the key.
         self.nb_parameters = (sizeof(void*)+sizeof(int)-1)/sizeof(int);
         // seconds two ints are used to store a pointer to the key of the task.
@@ -4181,7 +4256,7 @@ namespace ttg_parsec {
 
         auto &world_impl = world.impl();
 
-        if( world_impl.profiling() ) {
+        if( world_impl.profiling(WorldImpl::PROFILE_TASKS) ) {
           // first two ints are used to store the hash of the key.
           tc->nb_parameters = (sizeof(void*)+sizeof(int)-1)/sizeof(int);
           // seconds two ints are used to store a pointer to the key of the task.

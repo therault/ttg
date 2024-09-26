@@ -701,7 +701,7 @@ static int parseOption(std::string &option, int default_value) {
     pos = option.length();
   }
   token = option.substr(0, pos);
-  N = std::stoi(token);
+  N = std::stol(token);
   option.erase(0, pos + 1);
   return N;
 }

@@ -2718,8 +2718,10 @@ namespace ttg_parsec {
       if(buffer_size == 0)
         return buffer;
 
+      task_t *task = (task_t*)t;
+
       if constexpr (ttg::meta::is_void_v<keyT>) {
-        snprintf(buffer, buffer_size, "%s()[]<%d>", t->task_class->name, t->priority);
+        snprintf(buffer, buffer_size, "%s()[]<%d>", task->tt->get_full_name().c_str(), t->priority);
       }  else {
         // we use the locals array as a scratchpad to store the hash of the key and its actual address
         // locals[0] amd locals[1] hold the hash, while locals[2] and locals[3] hold the key pointer
@@ -2731,7 +2733,7 @@ namespace ttg_parsec {
         std::replace(keystr.begin(), keystr.end(), '(', ':');
         std::replace(keystr.begin(), keystr.end(), ')', ':');
 
-        snprintf(buffer, buffer_size, "%s(%s)[]<%d>", t->task_class->name, keystr.c_str(), t->priority);
+        snprintf(buffer, buffer_size, "%s(%s)[]<%d>", task->tt->get_full_name().c_str(), keystr.c_str(), t->priority);
       }
       return buffer;
     }
